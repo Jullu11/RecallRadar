@@ -1,0 +1,62 @@
+# RecallRadar
+
+RecallRadar helps a household identify a product from a receipt or label, check official recall evidence, and track a next step in iMessage.
+
+The first demo is scoped to household products and CPSC notices. Its deterministic historical example is the myCharge POWER HUB recall (CPSC recall 24-271). It is historical demonstration data, not a current alert feed. The notice affects models AO10FK-A, AO10FK-B, and AO10FK-C with date codes ending in 21 or 22, plus 0123, 0923, 1523, and 1723. See the [official CPSC notice](https://www.cpsc.gov/Recalls/2024/myCharge-Recalls-POWER-HUB-All-In-One-Portable-Chargers-Due-to-Fire-and-Burn-Hazards-Sold-Exclusively-at-Costco).
+
+## Local development
+
+Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The Python API and Spectrum Cloud gateway run as two local processes. The API binds to `127.0.0.1:8000`; the gateway binds to port `8001`.
+
+1. Install dependencies and create the local environment file:
+
+   ```sh
+   make setup
+   ```
+
+   This creates `.venv`, installs `requirements.txt`, installs the locked gateway dependencies with `npm ci`, and copies `.env.example` to `.env` if one does not exist.
+
+2. Fill in `.env`:
+
+   - `GEMINI_API_KEY`: Google AI Studio API key.
+   - `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`: your Supabase project values. Keep the service-role key on the backend; do not put it in client code.
+   - `SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET`: Spectrum Cloud project credentials.
+   - `BACKEND_INTERNAL_TOKEN`: a private random string shared only by the local gateway and API.
+   - `ALLOWED_SENDER_IDS`: your exact sender ID as Spectrum delivers it. Leave no blank allowlist in a working gateway; empty denies all senders. Separate multiple exact IDs with commas.
+
+3. Apply [`supabase/migrations/0001_initial_schema.sql`](supabase/migrations/0001_initial_schema.sql) to your Supabase project using its SQL editor.
+
+4. Start the API and gateway in separate terminals from the repository root:
+
+   ```sh
+   make api
+   ```
+
+   ```sh
+   make gateway
+   ```
+
+5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice).
+
+Spectrum Cloud needs a public HTTPS webhook. Use your preferred HTTPS tunnel to expose local port `8001`, then register `https://<tunnel-host>/webhook` in the Photon dashboard. Keep the FastAPI port private. `PUBLIC_BASE_URL` is optional documentation/configuration metadata; the gateway currently receives its external webhook URL in the Photon dashboard.
+
+Run `make local-check` to syntax-check the Python modules and type-check the gateway. No Gemini extraction, Supabase persistence, CPSC API request, or live Photon delivery is exercised by that command.
+
+## MVP behavior
+
+- Spectrum Cloud receives and sends direct iMessages through the Node gateway; FastAPI owns product and recall behavior.
+- Gemini extracts product identifiers from receipt and label images. Unknown fields remain unknown and require confirmation.
+- Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
+- CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
+
+Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
+
+Product records are saved only after the user confirms the extracted details. Monitoring is a separate opt-in. Receipt and label image bytes are passed to Gemini for extraction and are not written to Supabase. The MVP does not yet run scheduled repeat checks; it performs an initial check and records the user's follow-up response. Text `delete` to remove saved product records, conversation state, and message deduplication records.
+
+## Local setup troubleshooting
+
+- If the gateway exits at startup, check `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET`, and `ALLOWED_SENDER_IDS` in `.env`.
+- If the API starts but image extraction fails, check `GEMINI_API_KEY`.
+- If product saves fail, confirm the SQL migration was applied and the Supabase URL/service-role key are correct.
+- If Photon cannot deliver events, make sure the HTTPS tunnel is running and the Photon webhook URL ends in `/webhook`.
+- The API health route does not need external credentials; Gemini, Supabase, Spectrum, and the CPSC service do.

@@ -1,0 +1,18 @@
+{
+  "agency": "U.S. Consumer Product Safety Commission",
+  "recall_number": "24-271",
+  "title": "myCharge POWER HUB All-In-One 10,000mAh portable chargers",
+  "brand": "myCharge",
+  "product_name": "POWER HUB All-In-One 10,000mAh portable charger",
+  "url": "https://www.cpsc.gov/Recalls/2024/myCharge-Recalls-POWER-HUB-All-In-One-Portable-Chargers-Due-to-Fire-and-Burn-Hazards-Sold-Exclusively-at-Costco",
+  "recall_date": "2024-06-20",
+  "hazard": "The recalled portable chargers can overheat while charging, posing fire and burn hazards.",
+  "remedy": "Immediately stop using the recalled portable charger and contact myCharge for a free replacement.",
+  "affected_models": ["AO10FK-A", "AO10FK-B", "AO10FK-C"],
+  "date_code_rule": {
+    "format": "WWYY",
+    "matching_year_suffixes": ["21", "22"],
+    "matching_exact_codes": ["0123", "0923", "1523", "1723"]
+  },
+  "historical_fixture": true
+}
