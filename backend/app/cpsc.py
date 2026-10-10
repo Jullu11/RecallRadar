@@ -5,6 +5,9 @@ from typing import Any
 
 import httpx
 
+from .matcher import NOTICE, query_matches_demo_notice
+from .settings import get_settings
+
 
 CPSC_RECALLS_URL = "https://www.saferproducts.gov/RestWebServices/Recall"
 
@@ -48,30 +51,64 @@ def _rank(query: str, record: dict[str, Any]) -> float:
     return round(max(exact_phrase, token_coverage, SequenceMatcher(None, query_normalized, title).ratio()), 3)
 
 
-async def search_recalls(query: str) -> tuple[list[dict[str, Any]], str]:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
-        response = await client.get(
-            CPSC_RECALLS_URL,
-            params={"ProductName": query, "format": "JSON"},
-            headers={"Accept": "application/json"},
-        )
-        response.raise_for_status()
-        records = _record_list(response.json())
+def _fixture_candidate(query: str) -> dict[str, Any]:
+    return {
+        "recall_id": NOTICE["recall_number"],
+        "recall_number": NOTICE["recall_number"],
+        "recall_date": NOTICE["recall_date"],
+        "title": NOTICE["title"],
+        "description": NOTICE["hazard"],
+        "official_url": NOTICE["url"],
+        "consumer_contact": NOTICE["remedy"],
+        "retrieval_rank": _rank(query, {"Title": NOTICE["title"], "Description": NOTICE["hazard"], "Products": []}),
+        "source": "Historical fixture (CPSC recall 24-271)",
+        "historical_fixture": True,
+    }
 
-    candidates = []
-    for record in records:
-        candidates.append(
-            {
-                "recall_id": record.get("RecallID"),
-                "recall_number": str(record.get("RecallNumber", "")),
-                "recall_date": record.get("RecallDate"),
-                "title": record.get("Title"),
-                "description": record.get("Description"),
-                "official_url": record.get("URL"),
-                "consumer_contact": record.get("ConsumerContact"),
-                "retrieval_rank": _rank(query, record),
-                "source": "CPSC Recalls API",
-            }
-        )
-    candidates.sort(key=lambda item: item["retrieval_rank"], reverse=True)
-    return candidates[:20], response.headers.get("date", "")
+
+async def search_recalls(query: str) -> tuple[list[dict[str, Any]], str, bool]:
+    """Return (candidates, source_date_header, used_historical_fixture)."""
+    settings = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            response = await client.get(
+                CPSC_RECALLS_URL,
+                params={"ProductName": query, "format": "JSON"},
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            records = _record_list(response.json())
+
+        candidates = []
+        for record in records:
+            candidates.append(
+                {
+                    "recall_id": record.get("RecallID"),
+                    "recall_number": str(record.get("RecallNumber", "")),
+                    "recall_date": record.get("RecallDate"),
+                    "title": record.get("Title"),
+                    "description": record.get("Description"),
+                    "official_url": record.get("URL"),
+                    "consumer_contact": record.get("ConsumerContact"),
+                    "retrieval_rank": _rank(query, record),
+                    "source": "CPSC Recalls API",
+                    "historical_fixture": False,
+                }
+            )
+        candidates.sort(key=lambda item: item["retrieval_rank"], reverse=True)
+        top = candidates[:20]
+        source_date = response.headers.get("date", "")
+
+        # If live search misses the labeled demo notice but the query is clearly related, append fixture.
+        if (
+            settings.cpsc_fixture_fallback
+            and query_matches_demo_notice(query)
+            and not any(item["recall_number"] == NOTICE["recall_number"] for item in top)
+        ):
+            top = [_fixture_candidate(query), *top][:20]
+            return top, source_date, True
+        return top, source_date, False
+    except Exception:
+        if settings.cpsc_fixture_fallback and query_matches_demo_notice(query):
+            return [_fixture_candidate(query)], "", True
+        raise

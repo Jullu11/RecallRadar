@@ -1,4 +1,4 @@
-.PHONY: setup api gateway local-check
+.PHONY: setup api gateway local-check test
 
 setup:
 	@test -f .env || cp .env.example .env
@@ -13,6 +13,10 @@ api:
 gateway:
 	@npm --prefix gateway run dev
 
+test:
+	@DEMO_MODE=true PYTHONPATH=backend .venv/bin/python -m unittest discover -s tests -v
+
 local-check:
 	@.venv/bin/python -m compileall -q backend/app
 	@cd gateway && npm exec -- tsc --noEmit
+	@$(MAKE) test

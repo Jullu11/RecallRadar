@@ -40,7 +40,16 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
 
 Spectrum Cloud needs a public HTTPS webhook. Use your preferred HTTPS tunnel to expose local port `8001`, then register `https://<tunnel-host>/webhook` in the Photon dashboard. Keep the FastAPI port private. `PUBLIC_BASE_URL` is optional documentation/configuration metadata; the gateway currently receives its external webhook URL in the Photon dashboard.
 
-Run `make local-check` to syntax-check the Python modules and type-check the gateway. No Gemini extraction, Supabase persistence, CPSC API request, or live Photon delivery is exercised by that command.
+Run `make local-check` to syntax-check the Python modules, type-check the gateway, and run unit tests for identifier matching and conversation flows. That command does not call Gemini, live Photon, or require Supabase.
+
+With `DEMO_MODE=true` (default in `.env.example`) or with Supabase unset, the API uses in-memory persistence so you can exercise the conversation without a database. Text-only simulation:
+
+```sh
+make api
+curl -s -X POST 'http://127.0.0.1:8000/api/demo/chat?text=HELP'
+```
+
+If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled historical myCharge POWER HUB notice when the product query clearly matches that fixture.
 
 ## MVP behavior
 
