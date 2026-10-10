@@ -36,7 +36,15 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    make gateway
    ```
 
-5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice).
+   Optional evidence-desk UI (Vite + React):
+
+   ```sh
+   make web
+   ```
+
+   Then open [http://127.0.0.1:5173](http://127.0.0.1:5173). For a production build served by FastAPI on port 8000, run `make web-build` and open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). The live inventory/evidence payload is at [http://127.0.0.1:8000/api/dashboard](http://127.0.0.1:8000/api/dashboard).
 
 Spectrum Cloud needs a public HTTPS webhook. Use your preferred HTTPS tunnel to expose local port `8001`, then register `https://<tunnel-host>/webhook` in the Photon dashboard. Keep the FastAPI port private. `PUBLIC_BASE_URL` is optional documentation/configuration metadata; the gateway currently receives its external webhook URL in the Photon dashboard.
 

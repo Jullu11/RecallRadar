@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import hmac
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, MatchResult, ProductCheck, match_product, query_matches_demo_notice
 from .settings import get_settings
-from .storage import uses_memory_store
+from .storage import get_dashboard_snapshot, uses_memory_store
 
 
 app = FastAPI(
@@ -19,6 +23,20 @@ app = FastAPI(
     description="A source-backed household product recall assistant. Historical demo fixture only.",
     version="0.1.0",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 @app.get("/health")
@@ -34,6 +52,16 @@ def health() -> dict[str, object]:
 @app.get("/api/demo/notice")
 def demo_notice() -> dict:
     return NOTICE
+
+
+@app.get("/api/dashboard")
+def dashboard() -> dict:
+    snapshot = get_dashboard_snapshot()
+    return {
+        **snapshot,
+        "demo_notice": NOTICE,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/api/extract")
@@ -183,6 +211,18 @@ async def demo_chat(
         "image": None,
     }
     return await handle_photon_message(event)
+
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
+
+    @app.get("/")
+    def frontend_index() -> FileResponse:
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get("/desk")
+    def frontend_desk() -> FileResponse:
+        return FileResponse(FRONTEND_DIST / "index.html")
 
 
 # Keep query helper available for other modules/tests.

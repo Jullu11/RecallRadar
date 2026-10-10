@@ -461,3 +461,77 @@ def reset_memory_store() -> None:
         _MEMORY.follow_ups.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
+
+
+def get_dashboard_snapshot() -> dict[str, Any]:
+    """Team/demo dashboard payload: products, matches, notices, and follow-ups."""
+    if uses_memory_store():
+        with _MEMORY.lock:
+            products = sorted(
+                (copy.deepcopy(row) for row in _MEMORY.products.values()),
+                key=lambda item: item.get("created_at") or "",
+                reverse=True,
+            )
+            notices = [copy.deepcopy(row) for row in _MEMORY.notices.values()]
+            matches = sorted(
+                (copy.deepcopy(row) for row in _MEMORY.matches.values()),
+                key=lambda item: item.get("checked_at") or "",
+                reverse=True,
+            )
+            follow_ups = sorted(
+                (copy.deepcopy(row) for row in _MEMORY.follow_ups),
+                key=lambda item: item.get("created_at") or "",
+                reverse=True,
+            )
+        return {
+            "products": products,
+            "notices": notices,
+            "matches": matches,
+            "follow_ups": follow_ups,
+            "persistence": "memory",
+        }
+
+    client = get_supabase()
+    products = (
+        client.table("products")
+        .select("id,owner_handle,brand,product_name,identifiers,status,monitoring_enabled,source_type,created_at,updated_at")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    notices = (
+        client.table("notices")
+        .select("id,agency,external_id,title,official_url,affected_criteria,retrieved_at,historical_fixture")
+        .order("retrieved_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    matches = (
+        client.table("matches")
+        .select("id,product_id,notice_id,decision,evidence,checked_at")
+        .order("checked_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    follow_ups = (
+        client.table("follow_ups")
+        .select("id,product_id,notice_id,action,due_at,acknowledged_at,completed_at,created_at")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    return {
+        "products": products,
+        "notices": notices,
+        "matches": matches,
+        "follow_ups": follow_ups,
+        "persistence": "supabase",
+    }
