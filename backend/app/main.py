@@ -71,12 +71,17 @@ async def search_cpsc_recalls(
             detail="The CPSC recall check could not be completed. Try again later; no safety conclusion was made.",
         ) from error
 
+    checked_at = datetime.now(timezone.utc)
     if not candidates:
         return {
             "outcome": "no_match",
-            "summary": "No matching notice was returned from the CPSC API for this search. This does not establish that the product is safe.",
+            "summary": (
+                f"No matching notice was found in the CPSC sources checked for this search, "
+                f"checked at {checked_at.strftime('%Y-%m-%d %H:%M UTC')}. "
+                "This does not establish that the product is safe."
+            ),
             "candidates": [],
-            "checked_at": datetime.now(timezone.utc),
+            "checked_at": checked_at,
             "source_response_date": source_date or None,
             "used_historical_fixture": used_fixture,
         }
@@ -90,13 +95,22 @@ async def search_cpsc_recalls(
                 "retrieval_rank": demo_candidate["retrieval_rank"],
                 "verification_scope": "Exact model and date-code rules from the linked official notice.",
                 "used_historical_fixture": used_fixture or True,
+                "fixture_note": (
+                    "Labeled historical CPSC fixture (June 20, 2024); historical demonstration data, "
+                    "not a claim of a current active recall."
+                ),
             }
         return {
             "outcome": "possible_match",
-            "summary": "A CPSC notice may match this product. Send or type the model number and WWYY date code from the label to verify it.",
+            "summary": (
+                "A CPSC notice may match this product. Send a package-label photo, or type "
+                "MODEL <model on label> DATE <code on label> to verify it. "
+                "If a labeled historical fixture is used, it is historical demonstration data, "
+                "not a claim of a current active recall."
+            ),
             "notice": NOTICE,
             "missing_identifiers": ["model number", "date code (WWYY)"],
-            "checked_at": datetime.now(timezone.utc),
+            "checked_at": checked_at,
             "source_response_date": source_date or None,
             "used_historical_fixture": used_fixture or True,
         }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import re
 import sys
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -44,6 +45,8 @@ class PhotonMessage(BaseModel):
     image: PhotonImage | None = None
 
 
+IDENTIFIER_HINT = "MODEL <model on label> DATE <code on label>"
+
 HELP_TEXT = (
     "RecallRadar checks household products against CPSC recall notices.\n"
     "Commands:\n"
@@ -53,7 +56,7 @@ HELP_TEXT = (
     "• LIST — show saved products\n"
     "• CHECK — recheck the latest product\n"
     "• LABEL — request a label photo for identifiers\n"
-    "• MODEL AO10FK-A DATE 1521 — type identifiers\n"
+    f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
     "• DONE — acknowledge a follow-up\n"
     "• CONSUMED / RETURNED / REMOVED — update ownership\n"
     "• DELETE — remove your saved data\n"
@@ -70,8 +73,70 @@ def _no(text: str) -> bool:
     return text.strip().casefold() in {"no", "n", "nope", "wrong", "cancel"}
 
 
+def _checked_at() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _field_line(label: str, value: Any) -> str:
     return f"{label}: {value if value else 'not visible'}"
+
+
+def _looks_abbreviated(item: dict[str, Any]) -> bool:
+    """Receipt SKU-style names that are not useful for CPSC product search."""
+    name = str(item.get("product_name") or "").strip()
+    brand = str(item.get("brand") or "").strip()
+    uncertain = {str(field).casefold() for field in (item.get("uncertain_fields") or [])}
+    if "product_name" in uncertain:
+        return True
+    if not name:
+        return True
+    if re.search(r"\b\d+\s*(CT|EA|PK)\b", name, re.IGNORECASE) and not brand:
+        return True
+    tokens = name.split()
+    if not brand and len(name) <= 28 and name.upper() == name and any(character.isdigit() for character in name):
+        return True
+    if not brand and len(tokens) <= 5 and re.fullmatch(r"[A-Z0-9 ./\-]{3,28}", name):
+        return True
+    return False
+
+
+def _usable_for_cpsc_search(brand: str | None, product_name: str, identifiers: dict[str, Any]) -> bool:
+    if identifiers.get("model_number") or identifiers.get("upc") or identifiers.get("date_code"):
+        return True
+    item = {"brand": brand, "product_name": product_name, "uncertain_fields": []}
+    if _looks_abbreviated(item):
+        return False
+    if brand and product_name and len(product_name.strip()) >= 6:
+        return True
+    if product_name and len(product_name.strip()) >= 12 and " " in product_name.strip():
+        return True
+    return False
+
+
+def _rank_item_for_selection(item: dict[str, Any]) -> tuple[int, str]:
+    """Prefer clearer / more CPSC-relevant looking items when listing a receipt."""
+    score = 0
+    if item.get("brand"):
+        score += 2
+    if item.get("model_number"):
+        score += 3
+    if not _looks_abbreviated(item):
+        score += 2
+    name = str(item.get("product_name") or "")
+    return (-score, name.casefold())
+
+
+def _selection_prompt(items: list[dict[str, Any]]) -> str:
+    lines = []
+    for index, item in enumerate(items, start=1):
+        brand = item.get("brand") or "Unknown brand"
+        name = item.get("product_name") or "Unknown product"
+        lines.append(f"{index}. {brand} — {name}")
+    return (
+        "I found these items on the receipt:\n"
+        + "\n".join(lines)
+        + f"\nWhich should I check? Reply 1–{len(items)}."
+    )
 
 
 def _product_confirmation(source_type: str, products: list[dict[str, Any]]) -> str:
@@ -84,8 +149,15 @@ def _product_confirmation(source_type: str, products: list[dict[str, Any]]) -> s
         _field_line("Model", item.get("model_number")),
         _field_line("Date/lot code", item.get("date_code") or item.get("lot_number")),
     ]
-    uncertain = item.get("uncertain_fields") or []
-    extra = f" Please check: {', '.join(uncertain)}." if uncertain else ""
+    if source_type == "receipt" and _looks_abbreviated(item):
+        extra = (
+            " This receipt name looks abbreviated. After you confirm, send a photo of the package label "
+            "before I run a CPSC search."
+        )
+    elif item.get("uncertain_fields"):
+        extra = " Some details were hard to read — please confirm carefully."
+    else:
+        extra = ""
     return f"I read this {source_type} item:\n" + "\n".join(fields) + extra + "\nReply YES if this is right, or NO to try again."
 
 
@@ -127,6 +199,15 @@ def _format_list(products: list[dict[str, Any]]) -> str:
     return "Saved products:\n" + "\n".join(lines)
 
 
+def _fixture_transparency(used_fixture: bool) -> str:
+    if not used_fixture:
+        return ""
+    return (
+        " Using a labeled historical CPSC fixture (notice dated June 20, 2024) — "
+        "this is a historical notice for demonstration, not a claim of a current active recall."
+    )
+
+
 async def _check_saved_product(
     owner: str,
     product_id: str,
@@ -134,6 +215,17 @@ async def _check_saved_product(
     brand: str | None,
     identifiers: dict[str, Any],
 ) -> str:
+    if not _usable_for_cpsc_search(brand, product_name, identifiers):
+        set_conversation(
+            owner_handle=owner,
+            state="awaiting_label",
+            payload={"product_id": product_id, "brand": brand, "product_name": product_name, "identifiers": identifiers},
+        )
+        return (
+            "This receipt name looks abbreviated, so I'm not running a CPSC name search yet. "
+            f"Send a photo of the package label, or type {IDENTIFIER_HINT}."
+        )
+
     query = " ".join(part for part in (brand, product_name) if part)
     try:
         candidates, _, used_fixture = await search_recalls(query)
@@ -145,7 +237,7 @@ async def _check_saved_product(
         )
         return (
             "Your product is saved. I couldn't reach the CPSC recall source, so the check could not be completed. "
-            "Try again by sending `label` with a clear product-label photo, or type MODEL … DATE …"
+            f"Try again by sending `label` with a clear product-label photo, or type {IDENTIFIER_HINT}."
         )
 
     candidate = next((item for item in candidates if item["recall_number"] == NOTICE["recall_number"]), None)
@@ -159,10 +251,10 @@ async def _check_saved_product(
             state="awaiting_label",
             payload={"product_id": product_id, "brand": brand, "product_name": product_name, "identifiers": identifiers},
         )
-        fixture_note = " (using labeled historical fixture)" if used_fixture else ""
         return (
-            f"I found a possible match in the CPSC database{fixture_note}, but the receipt doesn't show the identifiers needed to verify it. "
-            "Send `label` with a clear photo of the product label, or type MODEL AO10FK-A DATE 1521.\n"
+            f"I found a possible match in the CPSC database.{_fixture_transparency(used_fixture)} "
+            "The receipt doesn't show the identifiers needed to verify it. "
+            f"Send `label` with a clear photo of the product label, or type {IDENTIFIER_HINT}.\n"
             f"Official CPSC notice: {NOTICE['url']}"
         )
 
@@ -175,7 +267,7 @@ async def _check_saved_product(
         )
         return (
             "I found possible CPSC notices by product name, but their exact affected identifiers need review. "
-            "Send `label` with a clear product-label photo so I can check the model and lot/date code.\n\n"
+            f"Send `label` with a clear product-label photo, or type {IDENTIFIER_HINT}.\n\n"
             + "\n".join(candidate_lines)
         )
 
@@ -184,7 +276,10 @@ async def _check_saved_product(
         state="idle",
         payload={"last_product_id": product_id, "brand": brand, "product_name": product_name, "identifiers": identifiers},
     )
-    return "No matching notice was returned by the CPSC API for this product-name search. That result does not establish that the product is safe."
+    return (
+        f"No matching notice was found in the CPSC sources checked for this product-name search, "
+        f"checked at {_checked_at()}. That result does not establish that the product is safe."
+    )
 
 
 def _verify_mycharge(
@@ -215,16 +310,64 @@ def _verify_mycharge(
         create_follow_up(product_id=product_id, notice_id=None, action=NOTICE["remedy"])
         set_conversation(owner_handle=owner, state="awaiting_follow_up", payload={"product_id": product_id})
         return (
-            "⚠ This is an affected product in the historical CPSC recall (June 20, 2024).\n"
+            "⚠ This product matches a labeled historical CPSC notice (June 20, 2024) — "
+            "historical demonstration data, not a claim of a current active recall.\n"
             f"Evidence: model {model} and date code {date_code} meet the notice criteria.\n"
             f"The CPSC notice says: {NOTICE['remedy']}\n"
             f"{NOTICE['url']}\nReply DONE after you've handled it."
         )
     if result.outcome == "possible_match":
         set_conversation(owner_handle=owner, state="awaiting_label", payload={"product_id": product_id})
-        return f"This is still a possible match because an identifier needs checking. {result.summary}\n{NOTICE['url']}"
+        return (
+            f"This is still a possible match because an identifier needs checking. {result.summary}\n"
+            f"{NOTICE['url']}"
+        )
     set_conversation(owner_handle=owner, state="idle", payload={"last_product_id": product_id})
-    return f"{result.summary}\nHistorical CPSC notice: {NOTICE['url']}"
+    return (
+        f"{result.summary}\n"
+        f"Checked against a labeled historical CPSC notice at {_checked_at()}: {NOTICE['url']}"
+    )
+
+
+def _save_receipt_item(owner: str, item: dict[str, Any]) -> dict[str, str]:
+    name = item.get("product_name")
+    if not name:
+        set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
+        return {"reply": "I couldn't save an item because its product name was unreadable. Please send a clearer receipt photo."}
+    identifiers = {
+        key: item.get(key)
+        for key in ("size_or_capacity", "purchase_date", "upc", "lot_number", "expiration_date", "model_number", "date_code")
+        if item.get(key)
+    }
+    saved = save_confirmed_product(
+        owner_handle=owner,
+        brand=item.get("brand"),
+        product_name=name,
+        identifiers=identifiers,
+        source_type="receipt",
+    )
+    product_payload = {
+        "product_id": saved["id"],
+        "brand": item.get("brand"),
+        "product_name": name,
+        "identifiers": identifiers,
+    }
+    if _looks_abbreviated(item) and not _usable_for_cpsc_search(item.get("brand"), name, identifiers):
+        set_conversation(owner_handle=owner, state="awaiting_label", payload=product_payload)
+        return {
+            "reply": (
+                "Saved the confirmed product details. This receipt name looks abbreviated. "
+                "Send a photo of the package label before I run a CPSC search. "
+                f"Or type {IDENTIFIER_HINT}."
+            )
+        }
+    set_conversation(owner_handle=owner, state="awaiting_monitor_optin", payload=product_payload)
+    return {
+        "reply": (
+            "Saved the confirmed product details. Should I monitor CPSC recall notices for it? "
+            "Reply MONITOR to opt in or NO to skip."
+        )
+    }
 
 
 async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
@@ -243,6 +386,8 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             source_type = "label" if state == "awaiting_label" else "receipt"
             if state == "awaiting_product_confirmation":
                 return {"reply": "Please reply YES or NO to confirm the previous photo before sending another one."}
+            if state == "awaiting_product_selection":
+                return {"reply": "Please reply with the item number first (for example, 1)."}
             if source_type == "label" and not payload.get("product_id"):
                 return {"reply": "Please send a receipt first so I know which household product this label belongs to."}
             raw = base64.b64decode(image["base64"], validate=True)
@@ -256,19 +401,29 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                         "Please resend a clear JPEG/PNG receipt or label photo, or try again in a moment."
                     )
                 }
+            items = [item.model_dump() for item in extracted.items]
+            if source_type == "receipt" and len(items) > 1:
+                ranked = sorted(items, key=_rank_item_for_selection)
+                set_conversation(
+                    owner_handle=owner,
+                    state="awaiting_product_selection",
+                    payload={"source_type": "receipt", "items": ranked},
+                )
+                return {"reply": _selection_prompt(ranked)}
+
             set_conversation(
                 owner_handle=owner,
                 state="awaiting_product_confirmation",
                 payload={
                     "source_type": source_type,
-                    "items": [item.model_dump() for item in extracted.items],
+                    "items": items,
                     "product_id": payload.get("product_id"),
                     "brand": payload.get("brand"),
                     "product_name": payload.get("product_name"),
                     "identifiers": payload.get("identifiers") or {},
                 },
             )
-            return {"reply": _product_confirmation(source_type, [item.model_dump() for item in extracted.items])}
+            return {"reply": _product_confirmation(source_type, items)}
 
         text = str(event.get("text") or "").strip()
         lowered = text.casefold()
@@ -290,6 +445,21 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
 
         if lowered == "list":
             return {"reply": _format_list(list_owner_products(owner_handle=owner))}
+
+        if state == "awaiting_product_selection":
+            pending_items = payload.get("items") or []
+            if not re.fullmatch(r"\d{1,2}", text.strip()):
+                return {"reply": f"Reply with a number from 1 to {len(pending_items)} to choose which item to check."}
+            choice = int(text.strip())
+            if choice < 1 or choice > len(pending_items):
+                return {"reply": f"That number is out of range. Reply 1–{len(pending_items)}."}
+            selected = pending_items[choice - 1]
+            set_conversation(
+                owner_handle=owner,
+                state="awaiting_product_confirmation",
+                payload={"source_type": "receipt", "items": [selected]},
+            )
+            return {"reply": _product_confirmation("receipt", [selected])}
 
         if state == "awaiting_product_confirmation":
             if _no(text):
@@ -319,31 +489,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 }
 
             item = pending_items[0] if pending_items else {}
-            name = item.get("product_name")
-            if not name:
-                set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
-                return {"reply": "I couldn't save an item because its product name was unreadable. Please send a clearer receipt photo."}
-            identifiers = {
-                key: item.get(key)
-                for key in ("size_or_capacity", "purchase_date", "upc", "lot_number", "expiration_date", "model_number", "date_code")
-                if item.get(key)
-            }
-            saved = save_confirmed_product(
-                owner_handle=owner,
-                brand=item.get("brand"),
-                product_name=name,
-                identifiers=identifiers,
-                source_type="receipt",
-            )
-            product_payload = {
-                "product_id": saved["id"],
-                "brand": item.get("brand"),
-                "product_name": name,
-                "identifiers": identifiers,
-            }
-            set_conversation(owner_handle=owner, state="awaiting_monitor_optin", payload=product_payload)
-            suffix = " I found more than one item; send another receipt photo later to add another." if len(pending_items) > 1 else ""
-            return {"reply": "Saved the confirmed product details." + suffix + " Should I monitor CPSC recall notices for it? Reply MONITOR to opt in or NO to skip."}
+            return _save_receipt_item(owner, item)
 
         if state == "awaiting_monitor_optin":
             if _no(text):
@@ -365,9 +511,28 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 )
             }
 
+        if lowered in {"check", "recheck"}:
+            product_id = payload.get("product_id") or payload.get("last_product_id")
+            if not product_id:
+                return {"reply": "No saved product to check yet. Send a receipt photo first."}
+            return {
+                "reply": await _check_saved_product(
+                    owner,
+                    product_id,
+                    payload.get("product_name") or "",
+                    payload.get("brand"),
+                    payload.get("identifiers") or {},
+                )
+            }
+
         if state == "awaiting_label":
             if lowered == "label":
-                return {"reply": "Send a clear photo of the product label, especially the model and date/lot code."}
+                return {
+                    "reply": (
+                        "Send a clear photo of the product label, especially the model and date/lot code. "
+                        f"Or type {IDENTIFIER_HINT}."
+                    )
+                }
             parsed = _parse_identifiers(text)
             if parsed.get("model_number") and parsed.get("date_code"):
                 updates = update_product_identifiers(
@@ -387,11 +552,16 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 update_product_identifiers(product_id=payload["product_id"], owner_handle=owner, updates=parsed)
                 missing = []
                 if not parsed.get("model_number") and not (payload.get("identifiers") or {}).get("model_number"):
-                    missing.append("MODEL …")
+                    missing.append("MODEL <model on label>")
                 if not parsed.get("date_code") and not (payload.get("identifiers") or {}).get("date_code"):
-                    missing.append("DATE …")
-                return {"reply": "Got it. Still need " + " and ".join(missing) + " (example: MODEL AO10FK-A DATE 1521)."}
-            return {"reply": "Please send a clear product-label photo, or type MODEL AO10FK-A DATE 1521."}
+                    missing.append("DATE <code on label>")
+                return {"reply": "Got it. Still need " + " and ".join(missing) + f". Example format: {IDENTIFIER_HINT}."}
+            return {
+                "reply": (
+                    "Please send a clear product-label photo, or type identifiers from the package as "
+                    f"{IDENTIFIER_HINT}."
+                )
+            }
 
         if state == "awaiting_follow_up":
             if lowered in {"done", "complete", "completed"}:
@@ -418,24 +588,15 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             set_conversation(owner_handle=owner, state="idle", payload={**payload, "last_product_id": product_id})
             return {"reply": f"Marked the saved product as {lowered}."}
 
-        if lowered in {"check", "recheck"}:
-            product_id = payload.get("product_id") or payload.get("last_product_id")
-            if not product_id:
-                return {"reply": "No saved product to check yet. Send a receipt photo first."}
-            return {
-                "reply": await _check_saved_product(
-                    owner,
-                    product_id,
-                    payload.get("product_name") or "",
-                    payload.get("brand"),
-                    payload.get("identifiers") or {},
-                )
-            }
-
         if lowered == "label" and payload.get("last_product_id"):
             current_payload = {**payload, "product_id": payload["last_product_id"]}
             set_conversation(owner_handle=owner, state="awaiting_label", payload=current_payload)
-            return {"reply": "Send a clear photo of the product label, especially the model and date/lot code."}
+            return {
+                "reply": (
+                    "Send a clear photo of the product label, especially the model and date/lot code. "
+                    f"Or type {IDENTIFIER_HINT}."
+                )
+            }
         if lowered in {"receipt", "add product", "add"}:
             set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
             return {"reply": "Send a clear receipt photo and I'll extract the product details for you to confirm."}
