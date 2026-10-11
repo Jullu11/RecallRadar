@@ -70,6 +70,7 @@ async function handleInbound(space: any, message: any): Promise<void> {
     try {
       const status = await fetch(`${backendUrl}/api/senders/linked`, {
         method: "POST",
+        signal: AbortSignal.timeout(120_000),
         headers: { "content-type": "application/json", "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN! },
         body: JSON.stringify({ sender_id: senderId }),
       });
@@ -124,10 +125,11 @@ async function handleInbound(space: any, message: any): Promise<void> {
     return;
   }
 
-  console.log(`Inbound from ${senderId}: ${String(incoming.text ?? "[attachment]").slice(0, 80)}`);
+  console.log("Inbound message received");
 
   const response = await fetch(`${backendUrl}/api/photon/message`, {
     method: "POST",
+        signal: AbortSignal.timeout(120_000),
     headers: {
       "content-type": "application/json",
       "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
@@ -159,6 +161,7 @@ async function dispatchPendingNotifications(): Promise<void> {
   try {
     const response = await fetch(`${backendUrl}/api/notifications/pending`, {
       method: "POST",
+        signal: AbortSignal.timeout(120_000),
       headers: {
         "content-type": "application/json",
         "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
@@ -170,14 +173,15 @@ async function dispatchPendingNotifications(): Promise<void> {
       return;
     }
     const payload = (await response.json()) as {
-      notifications?: Array<{ id: string; owner_handle: string; message: string }>;
+      notifications?: Array<{ id: string; recipient: string; claim_token: string; message: string }>;
     };
     for (const notification of payload.notifications ?? []) {
       try {
-        const space = await spectrum.space(notification.owner_handle);
+        const space = await imessage(spectrum).space(notification.recipient);
         await space.send(notification.message);
-        const ack = await fetch(`${backendUrl}/api/notifications/${encodeURIComponent(notification.id)}/sent`, {
+        const ack = await fetch(`${backendUrl}/api/notifications/${encodeURIComponent(notification.id)}/sent?claim_token=${encodeURIComponent(notification.claim_token)}`, {
           method: "POST",
+        signal: AbortSignal.timeout(120_000),
           headers: { "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN! },
         });
         if (!ack.ok) console.error("Notification acknowledgement failed", notification.id, ack.status);

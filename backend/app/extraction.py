@@ -18,6 +18,10 @@ class ExtractedProduct(BaseModel):
     expiration_date: str | None = None
     model_number: str | None = None
     date_code: str | None = None
+    merchant: str | None = None
+    amount_paid: str | None = None
+    order_number: str | None = None
+    payment_card: str | None = None
     uncertain_fields: list[str] = Field(default_factory=list)
 
 
@@ -44,6 +48,10 @@ EXTRACTION_SCHEMA = {
                     "expiration_date": {"type": "string", "nullable": True},
                     "model_number": {"type": "string", "nullable": True},
                     "date_code": {"type": "string", "nullable": True},
+                    "merchant": {"type": "string", "nullable": True},
+                    "amount_paid": {"type": "string", "nullable": True},
+                    "order_number": {"type": "string", "nullable": True},
+                    "payment_card": {"type": "string", "nullable": True},
                     "uncertain_fields": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["uncertain_fields"],
@@ -62,7 +70,9 @@ def extract_products(image_bytes: bytes, mime_type: str, source_type: str) -> Im
 
     client = genai.Client(api_key=settings.gemini_api_key)
     prompt = (
-        f"Read this {source_type} image and extract visible household product details. "
+        f"Read this {source_type} document and extract purchased product details. "
+        "amount_paid is the line-item amount in USD as a decimal without a currency symbol; do not substitute the receipt total. "
+        "payment_card may contain a user-recognizable label or last four digits only; never extract a full card number. "
         "Return each visible product as a separate item. Extract only legible text, use null "
         "for missing or unreadable fields, and list any field the user should check under "
         "uncertain_fields. Do not decide whether an item is recalled or summarize general "

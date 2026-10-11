@@ -651,12 +651,12 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 return {"reply": "Please send a receipt first so I know which household product this label belongs to."}
             raw = base64.b64decode(image["base64"], validate=True)
             receipt_fingerprint = hashlib.sha256(raw).hexdigest() if source_type == "receipt" else None
-            if receipt_fingerprint:
+            if raw:
                 try:
                     await run_in_threadpool(
                         save_receipt_image,
                         owner_handle=owner,
-                        fingerprint=receipt_fingerprint,
+                        fingerprint=hashlib.sha256(raw).hexdigest(),
                         image_bytes=raw,
                         mime_type=image["mime_type"],
                     )

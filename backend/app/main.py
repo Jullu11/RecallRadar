@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import hmac
+import logging
+from contextlib import asynccontextmanager
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 import httpx
@@ -17,8 +19,11 @@ from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, MatchResult, ProductCheck, match_product, query_matches_demo_notice
 from .settings import get_settings
+from .auth import authenticated_user_id as _authenticated_user_id, owner as current_owner
 from .storage import (
     get_dashboard_snapshot,
+    sender_owner,
+    notification_recipient,
     list_active_price_watches,
     list_pending_notifications,
     acknowledge_notification,
@@ -36,7 +41,18 @@ from .storage import (
 )
 
 
+@asynccontextmanager
+async def lifespan(app):
+    settings = get_settings()
+    if not settings.demo_mode:
+        missing = [name for name in ('supabase_url', 'supabase_service_role_key', 'supabase_anon_key') if not getattr(settings, name)]
+        if missing:
+            raise RuntimeError('Production configuration missing: ' + ', '.join(missing))
+    yield
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Lodestone",
     description="A source-backed household product recall assistant. Historical demo fixture only.",
     version="0.1.0",
@@ -44,12 +60,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-    ],
+    allow_origins=[url.strip() for url in get_settings().cors_origins.split(',') if url.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -72,27 +83,6 @@ def demo_notice() -> dict:
     return NOTICE
 
 
-def _authenticated_user_id(authorization: str | None) -> str:
-    settings = get_settings()
-    if not settings.supabase_url or not settings.supabase_service_role_key:
-        raise HTTPException(status_code=503, detail="Supabase Auth is not configured.")
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Sign in to view your evidence desk.")
-    try:
-        response = httpx.get(
-            f"{settings.supabase_url.rstrip('/')}/auth/v1/user",
-            headers={"apikey": settings.supabase_service_role_key, "Authorization": authorization},
-            timeout=8,
-        )
-        response.raise_for_status()
-        user_id = response.json().get("id")
-    except Exception as error:
-        raise HTTPException(status_code=401, detail="Your sign-in has expired. Please sign in again.") from error
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid sign-in session.")
-    return str(user_id)
-
-
 @app.get("/api/account")
 def account(authorization: str | None = Header(default=None)) -> dict[str, object]:
     user_id = _authenticated_user_id(authorization)
@@ -109,18 +99,9 @@ def account_link_code(authorization: str | None = Header(default=None)) -> dict[
 
 
 @app.get("/api/dashboard")
-def dashboard(authorization: str | None = Header(default=None)) -> dict:
-    settings = get_settings()
-    if settings.demo_mode or uses_memory_store():
-        snapshot = get_dashboard_snapshot()
-    else:
-        user_id = _authenticated_user_id(authorization)
-        sender = account_owner_handle(user_id=user_id)
-        if not sender:
-            raise HTTPException(status_code=403, detail="Link your iMessage sender to view your records.")
-        snapshot = get_dashboard_snapshot(owner_handle=sender)
+def dashboard(owner_handle: str = Depends(current_owner)) -> dict:
     return {
-        **snapshot,
+        **get_dashboard_snapshot(owner_handle=owner_handle),
         "demo_notice": NOTICE,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -176,7 +157,7 @@ def pending_notifications(x_lodestone_internal: str | None = Header(default=None
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
     today = datetime.now(timezone.utc).date()
-    owners = get_settings().allowed_sender_id_set | set(list_linked_sender_handles())
+    owners = {sender_owner(sender) for sender in get_settings().allowed_sender_id_set | set(list_linked_sender_handles())}
     for owner in owners:
         products = list_owner_products(owner_handle=owner)
         product_names = {row["id"]: row.get("product_name") or "your product" for row in products}
@@ -210,7 +191,7 @@ def pending_notifications(x_lodestone_internal: str | None = Header(default=None
         for watch in list_owner_price_watches(owner_handle=owner):
             current = watch.get("current_price")
             target = watch.get("target_price")
-            if watch.get("is_active") and current is not None and target is not None and float(current) <= float(target):
+            if not watch.get("check_error") and watch.get("last_checked_at") and watch.get("is_active") and current is not None and target is not None and float(current) <= float(target):
                 enqueue_notification(
                     owner_handle=owner,
                     dedupe_key=f"price-target:{watch['id']}",
@@ -221,12 +202,18 @@ def pending_notifications(x_lodestone_internal: str | None = Header(default=None
                     ),
                 )
 
-    return {"notifications": list_pending_notifications()}
+    notifications = []
+    for item in list_pending_notifications(limit=10):
+        recipient = notification_recipient(item['owner_handle'])
+        if recipient:
+            notifications.append({**item, 'recipient': recipient})
+    return {"notifications": notifications}
 
 
 @app.post("/api/notifications/{notification_id}/sent")
 def notification_sent(
     notification_id: str,
+    claim_token: str,
     x_lodestone_internal: str | None = Header(default=None),
 ) -> dict[str, bool]:
     expected = get_settings().backend_internal_token
@@ -234,7 +221,7 @@ def notification_sent(
         raise HTTPException(status_code=503, detail="The internal gateway token is not configured.")
     if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
         raise HTTPException(status_code=401, detail="Unauthorized.")
-    return {"acknowledged": acknowledge_notification(notification_id=notification_id)}
+    return {"acknowledged": acknowledge_notification(notification_id=notification_id, claim_token=claim_token)}
 
 
 @app.post("/api/senders/linked")
@@ -255,6 +242,7 @@ def sender_is_linked(
 async def extract_image(
     source_type: Literal["receipt", "label"] = Query(...),
     image: UploadFile = File(...),
+    owner_handle: str = Depends(current_owner),
 ) -> dict:
     if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(status_code=415, detail="Upload a JPEG, PNG, or WebP image.")
@@ -263,6 +251,11 @@ async def extract_image(
         raise HTTPException(status_code=413, detail="Image must be 10 MB or smaller.")
     if not image_bytes:
         raise HTTPException(status_code=400, detail="The uploaded image is empty.")
+    from .storage import save_receipt_image
+    import hashlib
+    await run_in_threadpool(save_receipt_image, owner_handle=owner_handle,
+                            fingerprint=hashlib.sha256(image_bytes).hexdigest(),
+                            image_bytes=image_bytes, mime_type=image.content_type)
     try:
         extracted = await run_in_threadpool(extract_products, image_bytes, image.content_type, source_type)
     except RuntimeError as error:
@@ -372,7 +365,9 @@ async def photon_message(
         raise HTTPException(status_code=400, detail="Unexpected attachment data.")
 
     try:
-        return await handle_photon_message(parsed.model_dump())
+        payload = parsed.model_dump()
+        payload['sender_id'] = sender_owner(parsed.sender_id)
+        return await handle_photon_message(payload)
     except Exception as error:
         import logging
 
@@ -391,6 +386,8 @@ async def demo_chat(
     sender_id: str = "demo-user",
 ) -> dict[str, str]:
     """Local text-only conversation simulator (no Photon credentials required)."""
+    if not get_settings().demo_mode:
+        raise HTTPException(404, "Not found.")
     from .conversation import handle_photon_message
 
     if not text or not text.strip():
@@ -406,12 +403,72 @@ async def demo_chat(
     return await handle_photon_message(event)
 
 
+from .workspace import router as workspace_router
+app.include_router(workspace_router)
+
+
+@app.get('/api/config')
+def public_config():
+    settings = get_settings()
+    return {'demo': settings.demo_mode,
+            'supabase_url': settings.supabase_url if not settings.demo_mode else None,
+            'supabase_anon_key': settings.supabase_anon_key if not settings.demo_mode else None,
+            'imessage_number': settings.imessage_number,
+            'extraction_enabled': bool(settings.gemini_api_key),
+            'prices_enabled': bool(settings.keepa_api_key)}
+
+
+@app.get('/ready')
+def ready():
+    if get_settings().demo_mode:
+        return {'ready': True, 'mode': 'demo'}
+    from .storage import get_supabase
+    try:
+        get_supabase().table('workspace_records').select('id').limit(1).execute()
+        get_supabase().table('receipt_images').select('filename').limit(1).execute()
+    except Exception:
+        raise HTTPException(503, 'Database migrations or connectivity need attention.')
+    return {'ready': True, 'mode': 'production'}
+
+
+@app.exception_handler(LookupError)
+async def not_found(request, error):
+    return JSONResponse(status_code=404, content={'detail': 'Record not found.'})
+
+
+@app.exception_handler(Exception)
+async def server_error(request, error):
+    logging.getLogger('lodestone').error('Request failed: %s', type(error).__name__)
+    return JSONResponse(status_code=500, content={'detail': 'The request could not be completed. Please retry.'})
+
+
+@app.middleware('http')
+async def response_headers(request, call_next):
+    try:
+        size = int(request.headers.get('content-length', '0'))
+    except ValueError:
+        return JSONResponse(status_code=400, content={'detail': 'Invalid content length.'})
+    if size > 15 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={'detail': 'Request is too large.'})
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['X-Frame-Options'] = 'DENY'
+    if request.url.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="frontend-assets")
 
     @app.get("/")
     def frontend_index() -> FileResponse:
         return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get('/hero-charger.jpg')
+    def hero_image():
+        return FileResponse(FRONTEND_DIST / 'hero-charger.jpg')
 
     @app.get("/desk")
     def frontend_desk() -> FileResponse:

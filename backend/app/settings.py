@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     spectrum_project_secret: str | None = None
     backend_internal_token: str | None = None
     public_base_url: str | None = None
+    imessage_number: str = ""
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     allowed_sender_ids: str = ""
-    # When true (or when Supabase is unset), conversation state uses in-memory storage.
+    # Explicit local demo only. Production never falls back to volatile storage.
     demo_mode: bool = False
     # When true, CPSC network failures fall back to the labeled historical myCharge fixture.
     cpsc_fixture_fallback: bool = True

@@ -18,9 +18,7 @@ def _now() -> str:
 
 def uses_memory_store() -> bool:
     settings = get_settings()
-    if settings.demo_mode:
-        return True
-    return not (settings.supabase_url and settings.supabase_service_role_key)
+    return settings.demo_mode
 
 
 # Backward-compatible alias used by older call sites.
@@ -38,6 +36,7 @@ class _MemoryStore:
         self.price_watches: dict[str, dict[str, Any]] = {}
         self.receipt_images: dict[tuple[str, str], dict[str, Any]] = {}
         self.notification_outbox: dict[str, dict[str, Any]] = {}
+        self.workspace_records: dict[str, dict[str, Any]] = {}
         self.account_links: dict[str, str] = {}
         self.account_link_codes: dict[str, dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
@@ -118,9 +117,44 @@ def save_confirmed_product(
             return {**existing.data[0], "_duplicate": True}
 
 
-def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: bytes, mime_type: str) -> None:
+    try:
+        result = client.table("products").insert(
+            {
+                "owner_handle": owner_handle,
+                "brand": brand,
+                "product_name": product_name,
+                "identifiers": identifiers,
+                "field_provenance": field_provenance or {},
+                "source_type": source_type,
+                "receipt_fingerprint": receipt_fingerprint,
+                "receipt_item_index": receipt_item_index,
+                "monitoring_enabled": False,
+            }
+        ).execute()
+        return {**result.data[0], "_duplicate": False}
+    except Exception as error:
+        # The unique receipt-item index closes the race between a duplicate lookup and insert.
+        if receipt_fingerprint is None or receipt_item_index is None or not (
+            "23505" in str(error) or "duplicate key" in str(error).casefold()
+        ):
+            raise
+        existing = (
+            client.table("products")
+            .select("id,owner_handle,brand,product_name,identifiers,field_provenance,source_type,monitoring_enabled,status,created_at")
+            .eq("owner_handle", owner_handle)
+            .eq("receipt_fingerprint", receipt_fingerprint)
+            .eq("receipt_item_index", receipt_item_index)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise
+        return {**existing.data[0], "_duplicate": True}
+
+
+def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: bytes, mime_type: str, filename: str = "Purchase document") -> None:
     """Retain a receipt image in private storage, deduplicated per sender and image."""
-    suffix = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime_type)
+    suffix = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "application/pdf": "pdf", "message/rfc822": "eml"}.get(mime_type)
     if not suffix:
         raise ValueError("Unsupported receipt image type.")
     owner_key = hashlib.sha256(owner_handle.encode("utf-8")).hexdigest()
@@ -128,7 +162,7 @@ def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: byte
     if uses_memory_store():
         with _MEMORY.lock:
             _MEMORY.receipt_images[(owner_handle, fingerprint)] = {
-                "bytes": bytes(image_bytes), "mime_type": mime_type, "path": path,
+                "bytes": bytes(image_bytes), "mime_type": mime_type, "path": path, "created_at": _now(), "filename": filename,
             }
         return
 
@@ -142,7 +176,7 @@ def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: byte
         if "already exists" not in str(error).casefold() and "duplicate" not in str(error).casefold():
             raise
     client.table("receipt_images").upsert(
-        {"owner_handle": owner_handle, "fingerprint": fingerprint, "storage_path": path, "mime_type": mime_type},
+        {"owner_handle": owner_handle, "fingerprint": fingerprint, "storage_path": path, "mime_type": mime_type, "filename": filename},
         on_conflict="owner_handle,fingerprint",
     ).execute()
 
@@ -202,24 +236,27 @@ def redeem_account_link_code(*, owner_handle: str, code: str) -> bool:
             row = _MEMORY.account_link_codes.get(code_hash)
             if not row or row["expires_at"] <= now:
                 return False
+            if any(sender == owner_handle and uid != row["user_id"] for uid, sender in _MEMORY.account_links.items()):
+                return False
+            if row["user_id"] in _MEMORY.account_links and _MEMORY.account_links[row["user_id"]] != owner_handle:
+                return False
+            new_owner = f"account:{row['user_id']}"
+            for collection in (_MEMORY.products, _MEMORY.price_watches, _MEMORY.notification_outbox, _MEMORY.workspace_records):
+                for item in collection.values():
+                    if item["owner_handle"] == owner_handle:
+                        item["owner_handle"] = new_owner
+            for key, image in list(_MEMORY.receipt_images.items()):
+                if key[0] == owner_handle:
+                    _MEMORY.receipt_images[(new_owner, key[1])] = _MEMORY.receipt_images.pop(key)
+            # Memory recovery cases carry an owner too; production derives it through products.
+            for item in _MEMORY.recovery_cases.values():
+                if item["owner_handle"] == owner_handle:
+                    item["owner_handle"] = new_owner
+            _MEMORY.conversations.pop(owner_handle, None)
             _MEMORY.account_links[row["user_id"]] = owner_handle
             del _MEMORY.account_link_codes[code_hash]
             return True
-    client = get_supabase()
-    rows = (
-        client.table("account_link_codes").update({"consumed_at": now})
-        .eq("code_hash", code_hash).is_("consumed_at", "null").gt("expires_at", now)
-        .select("user_id").execute().data
-    )
-    if not rows:
-        return False
-    try:
-        client.table("account_links").upsert(
-            {"user_id": rows[0]["user_id"], "owner_handle": owner_handle}, on_conflict="user_id",
-        ).execute()
-    except Exception:
-        return False
-    return True
+    return bool(get_supabase().rpc("redeem_lodestone_link", {"p_code_hash": code_hash, "p_sender": owner_handle}).execute().data)
 
 
 def account_owner_handle(*, user_id: str) -> str | None:
@@ -245,39 +282,6 @@ def list_linked_sender_handles() -> list[str]:
     result = get_supabase().table("account_links").select("owner_handle").limit(1000).execute()
     return [row["owner_handle"] for row in result.data or []]
 
-    try:
-        result = client.table("products").insert(
-            {
-                "owner_handle": owner_handle,
-                "brand": brand,
-                "product_name": product_name,
-                "identifiers": identifiers,
-                "field_provenance": field_provenance or {},
-                "source_type": source_type,
-                "receipt_fingerprint": receipt_fingerprint,
-                "receipt_item_index": receipt_item_index,
-                "monitoring_enabled": False,
-            }
-        ).execute()
-        return {**result.data[0], "_duplicate": False}
-    except Exception as error:
-        # The unique receipt-item index closes the race between a duplicate lookup and insert.
-        if receipt_fingerprint is None or receipt_item_index is None or not (
-            "23505" in str(error) or "duplicate key" in str(error).casefold()
-        ):
-            raise
-        existing = (
-            client.table("products")
-            .select("id,owner_handle,brand,product_name,identifiers,field_provenance,source_type,monitoring_enabled,status,created_at")
-            .eq("owner_handle", owner_handle)
-            .eq("receipt_fingerprint", receipt_fingerprint)
-            .eq("receipt_item_index", receipt_item_index)
-            .limit(1)
-            .execute()
-        )
-        if not existing.data:
-            raise
-        return {**existing.data[0], "_duplicate": True}
 
 
 def enable_monitoring(*, product_id: str, owner_handle: str) -> dict[str, Any]:
@@ -320,7 +324,7 @@ def list_owner_products(*, owner_handle: str) -> list[dict[str, Any]]:
     result = (
         get_supabase()
         .table("products")
-        .select("id,brand,product_name,identifiers,status,monitoring_enabled,created_at")
+        .select("id,brand,product_name,identifiers,field_provenance,receipt_fingerprint,receipt_item_index,status,monitoring_enabled,created_at")
         .eq("owner_handle", owner_handle)
         .order("created_at")
         .execute()
@@ -491,16 +495,12 @@ def list_active_price_watches(*, limit: int = 25) -> list[dict[str, Any]]:
                 copy.deepcopy(row) for row in _MEMORY.price_watches.values()
                 if row.get("is_active") and row.get("next_check_at", row.get("created_at", "")) <= now
             ]
-        rows.sort(key=lambda row: row.get("next_check_at") or row.get("created_at") or "")
-        return rows[:limit]
-    now = _now()
-    result = (
-        get_supabase().table("price_watches")
-        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,next_check_at,check_error,is_active,created_at")
-        .eq("is_active", True).lte("next_check_at", now)
-        .order("next_check_at").limit(limit).execute()
-    )
-    return result.data or []
+            rows.sort(key=lambda row: row.get("next_check_at") or row.get("created_at") or "")
+            rows = rows[:min(limit, 5)]
+            for row in rows:
+                _MEMORY.price_watches[row["id"]]["next_check_at"] = (datetime.now(timezone.utc)+timedelta(minutes=10)).isoformat()
+            return rows
+    return get_supabase().rpc("claim_lodestone_prices", {"batch_size": min(limit, 5)}).execute().data or []
 
 
 def record_price_check(
@@ -570,28 +570,26 @@ def enqueue_notification(*, owner_handle: str, dedupe_key: str, message: str) ->
 def list_pending_notifications(*, limit: int = 50) -> list[dict[str, Any]]:
     if uses_memory_store():
         with _MEMORY.lock:
-            rows = [copy.deepcopy(row) for row in _MEMORY.notification_outbox.values() if row.get("sent_at") is None]
-        rows.sort(key=lambda row: row.get("created_at", ""))
-        return rows[:limit]
-    result = (
-        get_supabase().table("notification_outbox")
-        .select("id,owner_handle,message,created_at")
-        .is_("sent_at", "null").order("created_at").limit(limit).execute()
-    )
-    return result.data or []
+            rows = sorted((r for r in _MEMORY.notification_outbox.values()
+                if not r.get("sent_at") and (not r.get("lease_until") or r["lease_until"] < _now())),
+                key=lambda r: r["created_at"])[:min(limit, 10)]
+            for row in rows:
+                row.update(claim_token=str(uuid.uuid4()), lease_until=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat())
+            return copy.deepcopy(rows)
+    return get_supabase().rpc("claim_lodestone_notifications", {"batch_size": min(limit, 10)}).execute().data or []
 
 
-def acknowledge_notification(*, notification_id: str) -> bool:
+def acknowledge_notification(*, notification_id: str, claim_token: str) -> bool:
     if uses_memory_store():
         with _MEMORY.lock:
             row = next((item for item in _MEMORY.notification_outbox.values() if item["id"] == notification_id), None)
-            if not row:
+            if not row or row.get("claim_token") != claim_token or row.get("sent_at"):
                 return False
             row["sent_at"] = _now()
             return True
     result = (
         get_supabase().table("notification_outbox").update({"sent_at": _now()})
-        .eq("id", notification_id).is_("sent_at", "null").execute()
+        .eq("id", notification_id).eq("claim_token", claim_token).is_("sent_at", "null").execute()
     )
     return bool(result.data)
 
@@ -614,6 +612,7 @@ def delete_owner_products(*, owner_handle: str) -> int:
                 watch_id: row for watch_id, row in _MEMORY.price_watches.items()
                 if row["product_id"] not in product_ids
             }
+            _MEMORY.workspace_records = {key: row for key, row in _MEMORY.workspace_records.items() if row["owner_handle"] != owner_handle}
             _MEMORY.conversations.pop(owner_handle, None)
             _MEMORY.receipt_images = {
                 key: row for key, row in _MEMORY.receipt_images.items() if key[0] != owner_handle
@@ -628,12 +627,18 @@ def delete_owner_products(*, owner_handle: str) -> int:
             return len(product_ids)
 
     client = get_supabase()
-    receipt_assets = client.table("receipt_images").select("storage_path").eq("owner_handle", owner_handle).execute()
+    asset_owners = [owner_handle]
+    if owner_handle.startswith("account:"):
+        linked = account_owner_handle(user_id=owner_handle.removeprefix("account:"))
+        if linked:
+            asset_owners.append(linked)
+    receipt_assets = client.table("receipt_images").select("storage_path").in_("owner_handle", asset_owners).execute()
     paths = [row["storage_path"] for row in (receipt_assets.data or [])]
     if paths:
         client.storage.from_("receipt-images").remove(paths)
-    client.table("receipt_images").delete().eq("owner_handle", owner_handle).execute()
+    client.table("receipt_images").delete().in_("owner_handle", asset_owners).execute()
     client.table("notification_outbox").delete().eq("owner_handle", owner_handle).execute()
+    client.table("workspace_records").delete().eq("owner_handle", owner_handle).execute()
     result = client.table("products").select("id").eq("owner_handle", owner_handle).execute()
     count = len(result.data or [])
     client.table("products").delete().eq("owner_handle", owner_handle).execute()
@@ -968,6 +973,7 @@ def reset_memory_store() -> None:
         _MEMORY.price_watches.clear()
         _MEMORY.receipt_images.clear()
         _MEMORY.notification_outbox.clear()
+        _MEMORY.workspace_records.clear()
         _MEMORY.account_links.clear()
         _MEMORY.account_link_codes.clear()
         _MEMORY.photon_events.clear()
@@ -1019,7 +1025,7 @@ def get_dashboard_snapshot(*, owner_handle: str | None = None) -> dict[str, Any]
     client = get_supabase()
     products_query = (
         client.table("products")
-        .select("id,owner_handle,brand,product_name,identifiers,field_provenance,status,monitoring_enabled,source_type,created_at,updated_at")
+        .select("id,owner_handle,brand,product_name,identifiers,field_provenance,receipt_fingerprint,receipt_item_index,status,monitoring_enabled,source_type,created_at,updated_at")
     )
     if owner_handle is not None:
         products_query = products_query.eq("owner_handle", owner_handle)
@@ -1084,3 +1090,19 @@ def get_dashboard_snapshot(*, owner_handle: str | None = None) -> dict[str, Any]
         "price_watches": price_watches,
         "persistence": "supabase",
     }
+
+
+def sender_owner(sender_id: str) -> str:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            uid = next((uid for uid, sender in _MEMORY.account_links.items() if sender == sender_id), None)
+    else:
+        rows = get_supabase().table('account_links').select('user_id').eq('owner_handle', sender_id).limit(1).execute().data or []
+        uid = rows[0]['user_id'] if rows else None
+    return f'account:{uid}' if uid else sender_id
+
+
+def notification_recipient(handle: str) -> str | None:
+    if not handle.startswith('account:'):
+        return handle if handle in get_settings().allowed_sender_id_set else None
+    return account_owner_handle(user_id=handle.removeprefix('account:'))

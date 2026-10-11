@@ -65,7 +65,8 @@ class ConversationTests(unittest.TestCase):
             {"brand": None, "product_name": "LD RED 100 CT EA"},
         ]
         prompt = _selection_prompt(items)
-        self.assertIn("Reply 1–2", prompt)
+        self.assertIn("Reply ALL", prompt)
+        self.assertIn("1,3", prompt)
         self.assertIn("1. Pepsi — Diet Pepsi", prompt)
 
     def test_abbreviated_skips_cpsc_name_search(self) -> None:
