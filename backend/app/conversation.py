@@ -1140,6 +1140,20 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             product_id = payload.get("product_id") or payload.get("last_product_id")
             if product_id and (parsed.get("model_number") or parsed.get("date_code")):
                 return {"reply": await _apply_typed_identifiers(owner, product_id, parsed)}
+            if re.search(r"\b(?:DATE|LOT)\b", text, re.IGNORECASE):
+                return {
+                    "reply": (
+                        "The date code is the 4-digit number printed on the product (for chargers, on the wall "
+                        "prong), not the purchase date. Type it as DATE <4 digits>, e.g. DATE 0123."
+                    )
+                }
+            if lowered in {"done", "complete", "completed"}:
+                return {
+                    "reply": (
+                        "I still need the identifiers before I can finish this check. "
+                        f"Send a label photo or type {IDENTIFIER_HINT}."
+                    )
+                }
             return {
                 "reply": (
                     "Please send a clear product-label photo, or type identifiers from the package as "

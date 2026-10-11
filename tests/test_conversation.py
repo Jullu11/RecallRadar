@@ -165,6 +165,25 @@ class ConversationTests(unittest.TestCase):
         self.assertIn("historical", second.casefold())
         self.assertIn("⚠", second)
 
+    def test_calendar_date_and_done_get_specific_guidance(self) -> None:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="myCharge",
+            product_name="POWER HUB",
+            identifiers={"model_number": "AO10FK-A"},
+            source_type="receipt",
+        )
+        set_conversation(
+            owner_handle=self.owner,
+            state="awaiting_label",
+            payload={"product_id": product["id"], "brand": "myCharge", "product_name": "POWER HUB"},
+        )
+        date_reply = self._send("Date: 10/10/26")
+        self.assertIn("4-digit", date_reply)
+        self.assertIn("not the purchase date", date_reply)
+        done_reply = self._send("Done")
+        self.assertIn("still need the identifiers", done_reply)
+
     def test_done_keeps_product_context_for_check(self) -> None:
         product = save_confirmed_product(
             owner_handle=self.owner,
