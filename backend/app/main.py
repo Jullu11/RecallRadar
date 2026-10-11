@@ -15,6 +15,7 @@ from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, MatchResult, ProductCheck, match_product, query_matches_demo_notice
 from .settings import get_settings
+from .snowflake_analytics import get_purchase_insights, snowflake_enabled
 from .storage import get_dashboard_snapshot, uses_memory_store
 
 
@@ -24,19 +25,42 @@ app = FastAPI(
     version="0.1.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+def _cors_origins() -> list[str]:
+    settings = get_settings()
+    origins = [
         "http://127.0.0.1:5173",
         "http://localhost:5173",
         "http://127.0.0.1:8000",
         "http://localhost:8000",
-    ],
+    ]
+    if settings.public_web_url:
+        origins.append(settings.public_web_url.rstrip("/"))
+    for item in settings.cors_origins.split(","):
+        cleaned = item.strip().rstrip("/")
+        if cleaned:
+            origins.append(cleaned)
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for origin in origins:
+        if origin not in seen:
+            seen.add(origin)
+            unique.append(origin)
+    return unique
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+HERO_IMAGE = FRONTEND_DIST / "hero-charger.jpg"
+if not HERO_IMAGE.exists():
+    HERO_IMAGE = Path(__file__).resolve().parents[2] / "frontend" / "public" / "hero-charger.jpg"
 
 
 @app.get("/health")
@@ -46,6 +70,7 @@ def health() -> dict[str, object]:
         "status": "ok",
         "demo_mode": settings.demo_mode or uses_memory_store(),
         "persistence": "memory" if uses_memory_store() else "supabase",
+        "snowflake": snowflake_enabled(),
     }
 
 
@@ -55,13 +80,19 @@ def demo_notice() -> dict:
 
 
 @app.get("/api/dashboard")
-def dashboard() -> dict:
-    snapshot = get_dashboard_snapshot()
+def dashboard(owner: str | None = Query(default=None, max_length=300)) -> dict:
+    snapshot = get_dashboard_snapshot(owner_handle=owner)
     return {
         **snapshot,
         "demo_notice": NOTICE,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/api/insights")
+def purchase_insights() -> dict:
+    """Purchase insights from Snowflake when configured; otherwise local snapshot metrics."""
+    return get_purchase_insights()
 
 
 @app.post("/api/extract")
@@ -170,8 +201,13 @@ async def photon_message(
     except Exception as error:
         raise HTTPException(status_code=422, detail="Invalid Photon message payload.") from error
 
-    allowed = get_settings().allowed_sender_id_set
-    if parsed.sender_id not in allowed and not (get_settings().demo_mode or uses_memory_store()):
+    settings = get_settings()
+    allowed = settings.allowed_sender_id_set
+    if (
+        not settings.allow_all_senders
+        and parsed.sender_id not in allowed
+        and not (settings.demo_mode or uses_memory_store())
+    ):
         raise HTTPException(status_code=403, detail="This sender is not allowed to use Lodestone.")
     if parsed.content_type == "attachment" and parsed.image is None:
         raise HTTPException(status_code=400, detail="Attachment data is missing.")
@@ -211,6 +247,13 @@ async def demo_chat(
         "image": None,
     }
     return await handle_photon_message(event)
+
+
+@app.get("/hero-charger.jpg")
+def hero_image() -> FileResponse:
+    if not HERO_IMAGE.exists():
+        raise HTTPException(status_code=404, detail="Hero image not found.")
+    return FileResponse(HERO_IMAGE, media_type="image/jpeg")
 
 
 if FRONTEND_DIST.exists():

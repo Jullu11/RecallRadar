@@ -14,6 +14,34 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _mirror_product(row: dict[str, Any]) -> dict[str, Any]:
+    """Copy a confirmed product into Snowflake without blocking the request path."""
+    if row.get("_duplicate"):
+        return row
+    from .snowflake_analytics import schedule, upsert_product
+
+    schedule(upsert_product, {key: value for key, value in row.items() if key != "_duplicate"})
+    return row
+
+
+def _owner_handle_for_product(product_id: str) -> str | None:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.products.get(product_id)
+            return str(row["owner_handle"]) if row else None
+    result = (
+        get_supabase()
+        .table("products")
+        .select("owner_handle")
+        .eq("id", product_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    return str(result.data[0]["owner_handle"])
+
+
 def uses_memory_store() -> bool:
     settings = get_settings()
     if settings.demo_mode:
@@ -94,7 +122,7 @@ def save_confirmed_product(
                 if duplicate:
                     return {**copy.deepcopy(duplicate), "_duplicate": True}
             _MEMORY.products[row["id"]] = row
-            return {**copy.deepcopy(row), "_duplicate": False}
+            return _mirror_product({**copy.deepcopy(row), "_duplicate": False})
 
     client = get_supabase()
     if receipt_fingerprint is not None and receipt_item_index is not None:
@@ -124,7 +152,7 @@ def save_confirmed_product(
                 "monitoring_enabled": False,
             }
         ).execute()
-        return {**result.data[0], "_duplicate": False}
+        return _mirror_product({**result.data[0], "_duplicate": False})
     except Exception as error:
         # The unique receipt-item index closes the race between a duplicate lookup and insert.
         if receipt_fingerprint is None or receipt_item_index is None or not (
@@ -155,7 +183,7 @@ def enable_monitoring(*, product_id: str, owner_handle: str) -> dict[str, Any]:
             row["monitoring_enabled"] = True
             row["monitoring_consented_at"] = _now()
             row["updated_at"] = _now()
-            return copy.deepcopy(row)
+            return _mirror_product(copy.deepcopy(row))
 
     result = (
         get_supabase()
@@ -172,7 +200,54 @@ def enable_monitoring(*, product_id: str, owner_handle: str) -> dict[str, Any]:
     )
     if not result.data:
         raise LookupError("Product was not found for this message sender.")
-    return result.data[0]
+    return _mirror_product(result.data[0])
+
+
+def disable_monitoring(*, product_id: str, owner_handle: str) -> dict[str, Any]:
+    """Explicit opt-out: stop proactive monitoring for one product."""
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.products.get(product_id)
+            if not row or row["owner_handle"] != owner_handle:
+                raise LookupError("Product was not found for this message sender.")
+            row["monitoring_enabled"] = False
+            row["updated_at"] = _now()
+            return _mirror_product(copy.deepcopy(row))
+
+    result = (
+        get_supabase()
+        .table("products")
+        .update({"monitoring_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()})
+        .eq("id", product_id)
+        .eq("owner_handle", owner_handle)
+        .execute()
+    )
+    if not result.data:
+        raise LookupError("Product was not found for this message sender.")
+    return _mirror_product(result.data[0])
+
+
+def get_owner_product(*, product_id: str, owner_handle: str) -> dict[str, Any] | None:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.products.get(product_id)
+            if not row or row["owner_handle"] != owner_handle:
+                return None
+            return copy.deepcopy(row)
+
+    result = (
+        get_supabase()
+        .table("products")
+        .select(
+            "id,owner_handle,brand,product_name,identifiers,field_provenance,source_type,"
+            "monitoring_enabled,status,created_at,updated_at"
+        )
+        .eq("id", product_id)
+        .eq("owner_handle", owner_handle)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
 
 
 def list_owner_products(*, owner_handle: str) -> list[dict[str, Any]]:
@@ -218,7 +293,11 @@ def create_recovery_case(
                 "completed_at": None,
             }
             _MEMORY.recovery_cases[row["id"]] = row
-            return copy.deepcopy(row)
+            mirrored = copy.deepcopy(row)
+            from .snowflake_analytics import schedule, upsert_recovery_case
+
+            schedule(upsert_recovery_case, mirrored)
+            return mirrored
 
     client = get_supabase()
     product = (
@@ -239,6 +318,10 @@ def create_recovery_case(
             "date_source": "user_confirmed",
         }
     ).execute()
+    mirrored = {**result.data[0], "owner_handle": owner_handle}
+    from .snowflake_analytics import schedule, upsert_recovery_case
+
+    schedule(upsert_recovery_case, mirrored)
     return result.data[0]
 
 
@@ -303,6 +386,8 @@ def set_recovery_case_status(
 
 def delete_owner_products(*, owner_handle: str) -> int:
     """Delete an owner's product records; related evidence cascades in Postgres."""
+    from .snowflake_analytics import delete_owner_analytics, schedule
+
     if uses_memory_store():
         with _MEMORY.lock:
             product_ids = [pid for pid, row in _MEMORY.products.items() if row["owner_handle"] == owner_handle]
@@ -319,7 +404,9 @@ def delete_owner_products(*, owner_handle: str) -> int:
             _MEMORY.photon_events = {
                 eid: row for eid, row in _MEMORY.photon_events.items() if row["owner_handle"] != owner_handle
             }
-            return len(product_ids)
+            count = len(product_ids)
+        schedule(delete_owner_analytics, owner_handle=owner_handle)
+        return count
 
     client = get_supabase()
     result = client.table("products").select("id").eq("owner_handle", owner_handle).execute()
@@ -327,6 +414,7 @@ def delete_owner_products(*, owner_handle: str) -> int:
     client.table("products").delete().eq("owner_handle", owner_handle).execute()
     client.table("conversations").delete().eq("owner_handle", owner_handle).execute()
     client.table("photon_events").delete().eq("owner_handle", owner_handle).execute()
+    schedule(delete_owner_analytics, owner_handle=owner_handle)
     return count
 
 
@@ -441,6 +529,8 @@ def update_product_identifiers(
     owner_handle: str,
     updates: dict[str, Any],
     provenance: dict[str, Any] | None = None,
+    brand: str | None = None,
+    product_name: str | None = None,
 ) -> dict[str, Any]:
     if uses_memory_store():
         with _MEMORY.lock:
@@ -449,6 +539,10 @@ def update_product_identifiers(
                 raise LookupError("Product was not found for this message sender.")
             identifiers = {**(row.get("identifiers") or {}), **updates}
             row["identifiers"] = identifiers
+            if brand is not None and str(brand).strip():
+                row["brand"] = brand
+            if product_name is not None and str(product_name).strip():
+                row["product_name"] = product_name
             field_provenance = copy.deepcopy(row.get("field_provenance") or {})
             default_provenance = {
                 "source": "user",
@@ -457,6 +551,12 @@ def update_product_identifiers(
             }
             for key in updates:
                 field_provenance[key] = copy.deepcopy((provenance or {}).get(key) or default_provenance)
+            if brand is not None and str(brand).strip():
+                field_provenance["brand"] = copy.deepcopy((provenance or {}).get("brand") or default_provenance)
+            if product_name is not None and str(product_name).strip():
+                field_provenance["product_name"] = copy.deepcopy(
+                    (provenance or {}).get("product_name") or default_provenance
+                )
             row["field_provenance"] = field_provenance
             row["updated_at"] = _now()
             return copy.deepcopy(row)
@@ -464,7 +564,7 @@ def update_product_identifiers(
     client = get_supabase()
     existing = (
         client.table("products")
-        .select("identifiers,field_provenance")
+        .select("identifiers,field_provenance,brand,product_name")
         .eq("id", product_id)
         .eq("owner_handle", owner_handle)
         .limit(1)
@@ -481,15 +581,23 @@ def update_product_identifiers(
     }
     for key in updates:
         field_provenance[key] = copy.deepcopy((provenance or {}).get(key) or default_provenance)
+    patch: dict[str, Any] = {
+        "identifiers": identifiers,
+        "field_provenance": field_provenance,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if brand is not None and str(brand).strip():
+        patch["brand"] = brand
+        field_provenance["brand"] = copy.deepcopy((provenance or {}).get("brand") or default_provenance)
+    if product_name is not None and str(product_name).strip():
+        patch["product_name"] = product_name
+        field_provenance["product_name"] = copy.deepcopy(
+            (provenance or {}).get("product_name") or default_provenance
+        )
+        patch["field_provenance"] = field_provenance
     result = (
         client.table("products")
-        .update(
-            {
-                "identifiers": identifiers,
-                "field_provenance": field_provenance,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        .update(patch)
         .eq("id", product_id)
         .eq("owner_handle", owner_handle)
         .execute()
@@ -553,6 +661,17 @@ def save_match_evidence(
                 "evidence": copy.deepcopy(evidence),
                 "checked_at": _now(),
             }
+            owner_handle = _MEMORY.products.get(product_id, {}).get("owner_handle")
+        from .snowflake_analytics import schedule, upsert_match
+
+        schedule(
+            upsert_match,
+            product_id=product_id,
+            owner_handle=owner_handle,
+            decision=decision,
+            notice_title=notice["title"],
+            official_url=notice["url"],
+        )
         return
 
     client = get_supabase()
@@ -589,6 +708,16 @@ def save_match_evidence(
         },
         on_conflict="product_id,notice_id",
     ).execute()
+    from .snowflake_analytics import schedule, upsert_match
+
+    schedule(
+        upsert_match,
+        product_id=product_id,
+        owner_handle=_owner_handle_for_product(product_id),
+        decision=decision,
+        notice_title=notice["title"],
+        official_url=notice["url"],
+    )
 
 
 def create_follow_up(*, product_id: str, notice_id: str | None, action: str) -> None:
@@ -657,28 +786,49 @@ def reset_memory_store() -> None:
         _MEMORY.conversations.clear()
 
 
-def get_dashboard_snapshot() -> dict[str, Any]:
-    """Team/demo dashboard payload: products, matches, notices, and follow-ups."""
+def get_dashboard_snapshot(*, owner_handle: str | None = None) -> dict[str, Any]:
+    """Dashboard payload: products, matches, notices, and follow-ups.
+
+    When owner_handle is set, only that sender's inventory is returned (personal desk link).
+    """
+    owner = owner_handle.strip() if owner_handle and owner_handle.strip() else None
     if uses_memory_store():
         with _MEMORY.lock:
             products = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.products.values()),
+                (
+                    copy.deepcopy(row)
+                    for row in _MEMORY.products.values()
+                    if owner is None or row.get("owner_handle") == owner
+                ),
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
+            product_ids = {product["id"] for product in products}
             notices = [copy.deepcopy(row) for row in _MEMORY.notices.values()]
             matches = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.matches.values()),
+                (
+                    copy.deepcopy(row)
+                    for row in _MEMORY.matches.values()
+                    if owner is None or row.get("product_id") in product_ids
+                ),
                 key=lambda item: item.get("checked_at") or "",
                 reverse=True,
             )
             follow_ups = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.follow_ups),
+                (
+                    copy.deepcopy(row)
+                    for row in _MEMORY.follow_ups
+                    if owner is None or row.get("product_id") in product_ids
+                ),
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
             recovery_cases = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.recovery_cases.values()),
+                (
+                    copy.deepcopy(row)
+                    for row in _MEMORY.recovery_cases.values()
+                    if owner is None or row.get("product_id") in product_ids
+                ),
                 key=lambda item: (item.get("due_date") or "9999-12-31", item.get("created_at") or ""),
             )
         return {
@@ -688,18 +838,19 @@ def get_dashboard_snapshot() -> dict[str, Any]:
             "follow_ups": follow_ups,
             "recovery_cases": recovery_cases,
             "persistence": "memory",
+            "owner_handle": owner,
         }
 
     client = get_supabase()
-    products = (
+    products_query = (
         client.table("products")
         .select("id,owner_handle,brand,product_name,identifiers,field_provenance,status,monitoring_enabled,source_type,created_at,updated_at")
         .order("created_at", desc=True)
         .limit(100)
-        .execute()
-        .data
-        or []
     )
+    if owner:
+        products_query = products_query.eq("owner_handle", owner)
+    products = products_query.execute().data or []
     notices = (
         client.table("notices")
         .select("id,agency,external_id,title,official_url,affected_criteria,retrieved_at,historical_fixture")
@@ -747,4 +898,5 @@ def get_dashboard_snapshot() -> dict[str, Any]:
         "follow_ups": follow_ups,
         "recovery_cases": recovery_cases,
         "persistence": "supabase",
+        "owner_handle": owner,
     }

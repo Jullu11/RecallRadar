@@ -65,8 +65,143 @@ class ConversationTests(unittest.TestCase):
             {"brand": None, "product_name": "LD RED 100 CT EA"},
         ]
         prompt = _selection_prompt(items)
-        self.assertIn("Reply 1–2", prompt)
+        self.assertIn("Reply ALL", prompt)
+        self.assertIn("numbers like 1,3", prompt)
         self.assertIn("1. Pepsi — Diet Pepsi", prompt)
+
+    def test_stop_disables_monitoring(self) -> None:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="myCharge",
+            product_name="POWER HUB",
+            identifiers={},
+            source_type="receipt",
+        )
+        from app.storage import enable_monitoring
+
+        enable_monitoring(product_id=product["id"], owner_handle=self.owner)
+        set_conversation(
+            owner_handle=self.owner,
+            state="idle",
+            payload={"last_product_id": product["id"], "product_id": product["id"], "product_name": "POWER HUB"},
+        )
+        reply = self._send("STOP")
+        self.assertIn("monitoring disabled", reply.casefold())
+        products = list_owner_products(owner_handle=self.owner)
+        self.assertFalse(products[0]["monitoring_enabled"])
+
+    def test_typed_identifiers_require_matching_candidate(self) -> None:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="Acme",
+            product_name="Kitchen Blender Pro",
+            identifiers={},
+            source_type="receipt",
+        )
+        set_conversation(
+            owner_handle=self.owner,
+            state="idle",
+            payload={
+                "last_product_id": product["id"],
+                "product_id": product["id"],
+                "brand": "Acme",
+                "product_name": "Kitchen Blender Pro",
+                "identifiers": {},
+            },
+        )
+        import app.conversation as conversation_module
+
+        async def fake_search(_query: str):
+            return [], "", False
+
+        original = conversation_module.search_recalls
+        conversation_module.search_recalls = fake_search  # type: ignore[assignment]
+        try:
+            reply = self._send("MODEL AO10FK-A DATE 1523")
+        finally:
+            conversation_module.search_recalls = original  # type: ignore[assignment]
+        self.assertNotIn("⚠", reply)
+        self.assertIn("does not establish", reply.casefold())
+
+    def test_model_and_date_merge_across_messages(self) -> None:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="myCharge",
+            product_name="POWER HUB",
+            identifiers={},
+            source_type="receipt",
+        )
+        set_conversation(
+            owner_handle=self.owner,
+            state="awaiting_label",
+            payload={
+                "product_id": product["id"],
+                "brand": "myCharge",
+                "product_name": "POWER HUB",
+                "identifiers": {},
+            },
+        )
+        import app.conversation as conversation_module
+        from app.matcher import NOTICE
+
+        async def fake_search(_query: str):
+            return [
+                {
+                    "recall_number": NOTICE["recall_number"],
+                    "title": NOTICE["title"],
+                    "official_url": NOTICE["url"],
+                    "retrieval_rank": 1.0,
+                }
+            ], "", True
+
+        original = conversation_module.search_recalls
+        conversation_module.search_recalls = fake_search  # type: ignore[assignment]
+        try:
+            first = self._send("MODEL AO10FK-A")
+            self.assertIn("still need", first.casefold())
+            second = self._send("DATE 1523")
+        finally:
+            conversation_module.search_recalls = original  # type: ignore[assignment]
+        self.assertIn("historical", second.casefold())
+        self.assertIn("⚠", second)
+
+    def test_done_keeps_product_context_for_check(self) -> None:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="myCharge",
+            product_name="POWER HUB",
+            identifiers={"model_number": "AO10FK-A", "date_code": "1523"},
+            source_type="receipt",
+        )
+        set_conversation(
+            owner_handle=self.owner,
+            state="awaiting_follow_up",
+            payload={"product_id": product["id"], "brand": "myCharge", "product_name": "POWER HUB"},
+        )
+        done = self._send("DONE")
+        self.assertIn("complete", done.casefold())
+
+        import app.conversation as conversation_module
+        from app.matcher import NOTICE
+
+        async def fake_search(_query: str):
+            return [
+                {
+                    "recall_number": NOTICE["recall_number"],
+                    "title": NOTICE["title"],
+                    "official_url": NOTICE["url"],
+                    "retrieval_rank": 1.0,
+                }
+            ], "", True
+
+        original = conversation_module.search_recalls
+        conversation_module.search_recalls = fake_search  # type: ignore[assignment]
+        try:
+            reply = self._send("CHECK")
+        finally:
+            conversation_module.search_recalls = original  # type: ignore[assignment]
+        self.assertNotIn("no saved product", reply.casefold())
+        self.assertIn("historical", reply.casefold())
 
     def test_abbreviated_skips_cpsc_name_search(self) -> None:
         product = save_confirmed_product(

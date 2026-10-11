@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import type { DashboardPayload, MatchRow, Product, RecoveryCase } from "./types";
+import { apiUrl } from "./config";
+import type { DashboardPayload, MatchRow, Product, PurchaseInsights, RecoveryCase } from "./types";
 
 type View = "home" | "desk";
 
@@ -15,39 +16,79 @@ function productTitle(product: Product): string {
   return brand ? `${brand} — ${product.product_name}` : product.product_name;
 }
 
+function initialView(): View {
+  if (typeof window === "undefined") return "home";
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  const params = new URLSearchParams(window.location.search);
+  if (path === "/desk" || params.has("owner")) return "desk";
+  return "home";
+}
+
+function ownerFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get("owner");
+  return value && value.trim() ? value.trim() : null;
+}
+
 export default function App() {
-  const [view, setView] = useState<View>("home");
+  const [view, setView] = useState<View>(initialView);
+  const [owner] = useState<string | null>(ownerFromUrl);
   const [data, setData] = useState<DashboardPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [insights, setInsights] = useState<PurchaseInsights | null>(null);
 
   useEffect(() => {
     if (view !== "desk") return;
     let cancelled = false;
+    const dashboardPath = owner
+      ? apiUrl(`/api/dashboard?owner=${encodeURIComponent(owner)}`)
+      : apiUrl("/api/dashboard");
     const load = async () => {
       setLoading(true);
       setError(null);
       try {
-        const response = await fetch("/api/dashboard");
+        const response = await fetch(dashboardPath);
         if (!response.ok) throw new Error(`Dashboard request failed (${response.status})`);
         const payload = (await response.json()) as DashboardPayload;
         if (cancelled) return;
         setData(payload);
-        setSelectedProductId((current) => current ?? payload.products[0]?.id ?? null);
+        setSelectedProductId((current) => {
+          if (current && payload.products.some((item) => item.id === current)) return current;
+          return payload.products[0]?.id ?? null;
+        });
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load dashboard");
       } finally {
         if (!cancelled) setLoading(false);
       }
     };
+    const loadInsights = async () => {
+      // Personal desk links stay focused on that sender's inventory.
+      if (owner) {
+        if (!cancelled) setInsights(null);
+        return;
+      }
+      try {
+        const response = await fetch(apiUrl("/api/insights"));
+        if (!response.ok) return;
+        const payload = (await response.json()) as PurchaseInsights;
+        if (!cancelled) setInsights(payload);
+      } catch {
+        // Insights are optional; desk inventory still works without Snowflake.
+      }
+    };
     void load();
+    void loadInsights();
     const timer = window.setInterval(() => void load(), 8000);
+    const insightsTimer = window.setInterval(() => void loadInsights(), 15000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      window.clearInterval(insightsTimer);
     };
-  }, [view]);
+  }, [view, owner]);
 
   const selectedProduct = useMemo(
     () => data?.products.find((item) => item.id === selectedProductId) ?? null,
@@ -122,12 +163,19 @@ export default function App() {
         <header className="desk-header">
           <div>
             <p className="eyebrow">Lodestone</p>
-            <h2>Recall evidence desk</h2>
+            <h2>{owner ? "Your purchase desk" : "Recall evidence desk"}</h2>
+            {owner ? (
+              <p className="desk-owner-note">
+                Showing saved receipts for this iMessage chat. Pull to refresh isn’t needed — this updates
+                automatically.
+              </p>
+            ) : null}
           </div>
           <div className="desk-meta">
             <div>{data ? `Updated ${new Date(data.generated_at).toLocaleString()}` : "Loading…"}</div>
             <div>{data ? `Persistence: ${data.persistence}` : null}</div>
-            <button className="btn btn-ghost" type="button" style={{ color: "var(--ink)", marginTop: "0.5rem" }} onClick={() => setView("home")}>
+            {owner ? <div className="desk-scope">Personal view</div> : null}
+            <button className="btn btn-ghost desk-back" type="button" onClick={() => setView("home")}>
               Back to home
             </button>
           </div>
@@ -159,6 +207,53 @@ export default function App() {
 
         {error ? <p className="error">{error}</p> : null}
         {loading && !data ? <p className="empty">Loading inventory from the live agent…</p> : null}
+
+        {insights ? (
+          <section className="reminder-panel insights-panel" aria-label="Purchase insights">
+            <div className="reminder-heading">
+              <div>
+                <p className="eyebrow">Purchase insights</p>
+                <h3 className="panel-title">
+                  {insights.snowflake_enabled ? "Snowflake analytics" : "Local snapshot metrics"}
+                </h3>
+              </div>
+              <span>
+                {insights.used_cortex ? "Cortex summary" : insights.source.replace("_", " ")}
+              </span>
+            </div>
+            <p className="insights-summary">{insights.summary}</p>
+            <ul className="insights-metrics">
+              <li>
+                <strong>{insights.metrics.product_count}</strong>
+                <span>saved</span>
+              </li>
+              <li>
+                <strong>{insights.metrics.monitoring_count}</strong>
+                <span>monitored</span>
+              </li>
+              <li>
+                <strong>{insights.metrics.affected_count}</strong>
+                <span>affected</span>
+              </li>
+              <li>
+                <strong>{insights.metrics.possible_match_count}</strong>
+                <span>needs review</span>
+              </li>
+              <li>
+                <strong>{insights.metrics.due_within_30_days}</strong>
+                <span>due ≤30d</span>
+              </li>
+              <li>
+                <strong>{insights.metrics.overdue_count}</strong>
+                <span>overdue</span>
+              </li>
+            </ul>
+            <p className="reminder-note">
+              Supabase/memory is the system of record. Snowflake holds an analytics copy for insights
+              {insights.used_cortex ? " summarized with Cortex" : ""}.
+            </p>
+          </section>
+        ) : null}
 
         <section className="reminder-panel" aria-label="Open purchase reminders">
           <div className="reminder-heading">

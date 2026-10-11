@@ -25,9 +25,13 @@ const allowedSenderIds = new Set(
     .map((senderId) => senderId.trim())
     .filter(Boolean),
 );
+// ALLOWED_SENDER_IDS=* opens the gateway to every Spectrum sender (hackathon / public demo).
+const allowAllSenders = allowedSenderIds.has("*");
 
-if (allowedSenderIds.size === 0) {
-  throw new Error("ALLOWED_SENDER_IDS must contain at least one exact Spectrum sender ID.");
+if (!allowAllSenders && allowedSenderIds.size === 0) {
+  throw new Error(
+    "ALLOWED_SENDER_IDS must contain at least one exact Spectrum sender ID, or * to allow anyone.",
+  );
 }
 
 type ContentPart = {
@@ -67,7 +71,7 @@ async function handleInbound(space: any, message: any): Promise<void> {
   if (space.type === "group") return;
 
   const senderId = String(message.sender?.id ?? space.id);
-  if (!allowedSenderIds.has(senderId)) {
+  if (!allowAllSenders && !allowedSenderIds.has(senderId)) {
     console.warn(`Blocked sender: ${senderId} (not in ALLOWED_SENDER_IDS)`);
     return;
   }
@@ -148,7 +152,11 @@ serve({ fetch: app.fetch, port }, (info) => {
 });
 
 console.log("Listening for iMessages on Spectrum app.messages stream…");
-console.log(`Allowed senders: ${[...allowedSenderIds].join(", ")}`);
+console.log(
+  allowAllSenders
+    ? "Allowed senders: * (anyone)"
+    : `Allowed senders: ${[...allowedSenderIds].join(", ")}`,
+);
 
 for await (const [space, message] of spectrum.messages) {
   try {

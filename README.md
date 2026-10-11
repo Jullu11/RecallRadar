@@ -4,6 +4,10 @@ Lodestone helps people save purchase records once and use them later for warrant
 
 The first demo is scoped to household products and CPSC notices. Its deterministic historical example is the myCharge POWER HUB recall (CPSC recall 24-271). It is historical demonstration data, not a current alert feed. The notice affects models AO10FK-A, AO10FK-B, and AO10FK-C with date codes ending in 21 or 22, plus 0123, 0923, 1523, and 1723. See the [official CPSC notice](https://www.cpsc.gov/Recalls/2024/myCharge-Recalls-POWER-HUB-All-In-One-Portable-Chargers-Due-to-Fire-and-Burn-Hazards-Sold-Exclusively-at-Costco).
 
+**Verification scope:** exact model/date-code verification currently covers that labeled myCharge POWER HUB notice only. Other CPSC hits stay “possible, needs review,” which is intentional — the agent surfaces candidates and official URLs without claiming an affected/not-affected conclusion for notices that lack implemented identifier rules.
+
+**Storage split:** iMessage writes go to Supabase (or in-memory demo storage). An optional Snowflake warehouse receives an async analytics copy of confirmed purchases, recall decisions, and recovery actions. The evidence desk’s **Purchase insights** panel reads `/api/insights` (Snowflake + Cortex when configured; otherwise local snapshot metrics).
+
 ## Local development
 
 Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The Python API and Spectrum Cloud gateway run as two local processes. The API binds to `127.0.0.1:8000`; the gateway binds to port `8001`.
@@ -24,9 +28,11 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    - `BACKEND_INTERNAL_TOKEN`: a private random string shared only by the local gateway and API.
    - `ALLOWED_SENDER_IDS`: your exact sender ID as Spectrum delivers it. Leave no blank allowlist in a working gateway; empty denies all senders. Separate multiple exact IDs with commas.
 
-3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor.
+3. Optional: apply SQL migrations `0001`–`0003` in `supabase/migrations/` if you want Supabase persistence. With `DEMO_MODE=true` or Supabase unset, the API uses in-memory storage.
 
-4. Start the API and gateway in separate terminals from the repository root:
+4. Optional Snowflake analytics: create a warehouse/database, run `snowflake/setup.sql`, then fill `SNOWFLAKE_*` in `.env`. Sync is asynchronous (iMessage never waits on Snowflake). `DELETE` removes the owner’s analytics rows too. Set `SNOWFLAKE_USE_CORTEX=true` to summarize metrics with Cortex when available.
+
+5. Start the API and gateway in separate terminals from the repository root:
 
    ```sh
    make api
@@ -42,15 +48,15 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    make web
    ```
 
-   Then open [http://127.0.0.1:5173](http://127.0.0.1:5173). For a production build served by FastAPI on port 8000, run `make web-build` and open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+   Then open [http://127.0.0.1:5173](http://127.0.0.1:5173). For a production build served by FastAPI on port 8000, run `make web-build` and open [http://127.0.0.1:8000](http://127.0.0.1:8000). The landing hero image is served at `/hero-charger.jpg`.
 
-5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). The live inventory/evidence payload is at [http://127.0.0.1:8000/api/dashboard](http://127.0.0.1:8000/api/dashboard).
+6. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). The live inventory/evidence payload is at [http://127.0.0.1:8000/api/dashboard](http://127.0.0.1:8000/api/dashboard). Purchase insights are at [http://127.0.0.1:8000/api/insights](http://127.0.0.1:8000/api/insights).
 
 The gateway connects outbound to Spectrum Cloud and listens to its message stream. It calls the local FastAPI service at `http://127.0.0.1:8000`; this setup does not need a public webhook or HTTPS tunnel. Keep the FastAPI port private.
 
 Run `make local-check` to syntax-check the Python modules, type-check the gateway, and run unit tests for identifier matching and conversation flows. That command does not call Gemini, live Photon, or require Supabase.
 
-With `DEMO_MODE=true` (default in `.env.example`) or with Supabase unset, the API uses in-memory persistence so you can exercise the conversation without a database. Text-only simulation:
+With `DEMO_MODE=true` (default) or with Supabase unset, the API uses in-memory persistence so you can exercise the conversation without a database. Text-only simulation:
 
 ```sh
 make api
@@ -65,16 +71,16 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Gemini extracts product identifiers from receipt and label images. Unknown fields remain unknown and require confirmation.
 - Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
 - The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. It does not retain uploaded receipt or label image bytes.
-- Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
+- Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks. Text `STOP` to disable monitoring for the current/latest product.
 - Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
-- CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
+- CPSC provides recall candidates. Exact identifiers determine the result only for the included historical myCharge fixture; other CPSC hits remain possible matches that need manual review against the official notice.
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
 - `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. These are in-app/on-demand reminders; scheduled outbound messages are not configured.
 - `PACKET <action number> FOR <merchant>` drafts a copyable support message from the saved product details and the date the user entered. Missing order, payment, and issue details remain placeholders; the packet does not assert merchant policy or eligibility and is not submitted or saved as a separate record.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 
-Product records are saved only after the user confirms the extracted details. Monitoring is a separate opt-in. Receipt and label image bytes are passed to Gemini for extraction and are not written to Supabase. The MVP does not yet run scheduled repeat checks; it performs an initial check and records the user's follow-up response. Text `delete` to remove saved product records, conversation state, and message deduplication records.
+Product records are saved only after the user confirms the extracted details. Monitoring is a separate opt-in (and `STOP` opts out). Receipt and label image bytes are passed to Gemini for extraction and are not written to Supabase. The MVP does not yet run scheduled repeat checks; it performs an initial check and records the user's follow-up response. Text `delete` to remove saved product records, conversation state, and message deduplication records.
 
 ## Local setup troubleshooting
 

@@ -6,6 +6,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -13,14 +14,17 @@ from starlette.concurrency import run_in_threadpool
 from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, ProductCheck, match_product
+from .settings import get_settings
 from .storage import (
     claim_photon_event,
     complete_latest_follow_up,
     create_follow_up,
     create_recovery_case,
     delete_owner_products,
+    disable_monitoring,
     enable_monitoring,
     get_conversation,
+    get_owner_product,
     list_owner_products,
     list_owner_recovery_cases,
     mark_photon_event_failed,
@@ -59,6 +63,7 @@ HELP_TEXT = (
     "• YES / NO — confirm extracted details\n"
     "• MONITOR [number] / NO — opt in or skip monitoring\n"
     "• LIST — show saved products\n"
+    "• DESK — open your phone-friendly evidence desk link\n"
     "• CHECK [number] — check the latest product or a numbered item\n"
     "• LABEL — request a label photo for identifiers\n"
     "• RETURN BY YYYY-MM-DD — track a return deadline you confirm\n"
@@ -72,9 +77,12 @@ HELP_TEXT = (
     "• EDIT <field> <value> — correct extracted fields before confirming\n"
     f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
     "• DONE — acknowledge a follow-up\n"
+    "• STOP — disable monitoring for the current/latest product\n"
     "• CONSUMED / RETURNED / REMOVED — update ownership\n"
     "• DELETE — remove your saved data\n"
     "• HELP — show this message\n"
+    "Exact identifier verification currently covers the labeled historical myCharge POWER HUB notice only. "
+    "Other CPSC hits stay possible matches that need manual review. "
     "A 'no match' result is not a guarantee of safety."
 )
 
@@ -281,9 +289,28 @@ def _parse_identifiers(text: str) -> dict[str, str]:
     return found
 
 
-def _format_list(products: list[dict[str, Any]]) -> str:
+def _web_base_url() -> str:
+    settings = get_settings()
+    base = (settings.public_web_url or "").strip().rstrip("/")
+    if base:
+        return base
+    return "http://127.0.0.1:8000"
+
+
+def _desk_url(owner: str) -> str:
+    return f"{_web_base_url()}/desk?owner={quote(owner, safe='')}"
+
+
+def _desk_line(owner: str) -> str:
+    return f"Phone desk: {_desk_url(owner)}"
+
+
+def _format_list(products: list[dict[str, Any]], *, owner: str | None = None) -> str:
     if not products:
-        return "You have no saved products yet. Send a receipt photo to add one."
+        empty = "You have no saved products yet. Send a receipt photo to add one."
+        if owner:
+            return f"{empty}\n{_desk_line(owner)}"
+        return empty
     lines = []
     for index, product in enumerate(products, start=1):
         brand = product.get("brand") or "Unknown brand"
@@ -291,7 +318,10 @@ def _format_list(products: list[dict[str, Any]]) -> str:
         status = product.get("status") or "owned"
         monitoring = "monitoring on" if product.get("monitoring_enabled") else "monitoring off"
         lines.append(f"{index}. {brand} — {name} ({status}, {monitoring})")
-    return "Saved products:\n" + "\n".join(lines)
+    body = "Saved products:\n" + "\n".join(lines)
+    if owner:
+        return f"{body}\n{_desk_line(owner)}"
+    return body
 
 
 def _format_recovery_cases(cases: list[dict[str, Any]], products: list[dict[str, Any]]) -> str:
@@ -442,7 +472,16 @@ async def _check_saved_product(
         model = identifiers.get("model_number")
         date_code = identifiers.get("date_code")
         if model and date_code:
-            return _verify_mycharge(owner, product_id, str(model), str(date_code), candidate["retrieval_rank"])
+            return _verify_mycharge(
+                owner,
+                product_id,
+                str(model),
+                str(date_code),
+                candidate["retrieval_rank"],
+                brand=brand,
+                product_name=product_name,
+                identifiers=identifiers,
+            )
         set_conversation(
             owner_handle=owner,
             state="awaiting_label",
@@ -479,14 +518,35 @@ async def _check_saved_product(
     )
 
 
+def _product_context_payload(product: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "product_id": product["id"],
+        "last_product_id": product["id"],
+        "brand": product.get("brand"),
+        "product_name": product.get("product_name") or "",
+        "identifiers": product.get("identifiers") or {},
+    }
+
+
 def _verify_mycharge(
     owner: str,
     product_id: str,
     model: str,
     date_code: str,
     retrieval_rank: float | None = None,
+    *,
+    brand: str | None = None,
+    product_name: str | None = None,
+    identifiers: dict[str, Any] | None = None,
 ) -> str:
     result = match_product(ProductCheck(model=model, date_code=date_code))
+    context = {
+        "product_id": product_id,
+        "last_product_id": product_id,
+        "brand": brand,
+        "product_name": product_name or "",
+        "identifiers": identifiers or {"model_number": model, "date_code": date_code},
+    }
     save_match_evidence(
         product_id=product_id,
         notice=NOTICE,
@@ -505,7 +565,7 @@ def _verify_mycharge(
     )
     if result.outcome == "affected":
         create_follow_up(product_id=product_id, notice_id=None, action=NOTICE["remedy"])
-        set_conversation(owner_handle=owner, state="awaiting_follow_up", payload={"product_id": product_id})
+        set_conversation(owner_handle=owner, state="awaiting_follow_up", payload=context)
         return (
             "⚠ This product matches a labeled historical CPSC notice (June 20, 2024) — "
             "historical demonstration data, not a claim of a current active recall.\n"
@@ -514,16 +574,52 @@ def _verify_mycharge(
             f"{NOTICE['url']}\nReply DONE after you've handled it."
         )
     if result.outcome == "possible_match":
-        set_conversation(owner_handle=owner, state="awaiting_label", payload={"product_id": product_id})
+        set_conversation(owner_handle=owner, state="awaiting_label", payload=context)
         return (
             f"This is still a possible match because an identifier needs checking. {result.summary}\n"
             f"{NOTICE['url']}"
         )
-    set_conversation(owner_handle=owner, state="idle", payload={"last_product_id": product_id})
+    set_conversation(owner_handle=owner, state="idle", payload=context)
     return (
         f"{result.summary}\n"
         f"Checked against a labeled historical CPSC notice at {_checked_at()}: {NOTICE['url']}"
     )
+
+
+async def _apply_typed_identifiers(
+    owner: str,
+    product_id: str,
+    parsed: dict[str, str],
+    *,
+    brand_update: str | None = None,
+    product_name_update: str | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> str:
+    """Merge typed/label identifiers, then run candidate-aware recall checking."""
+    updated = update_product_identifiers(
+        product_id=product_id,
+        owner_handle=owner,
+        updates=parsed,
+        provenance=provenance,
+        brand=brand_update,
+        product_name=product_name_update,
+    )
+    identifiers = updated.get("identifiers") or {}
+    set_conversation(owner_handle=owner, state="awaiting_label", payload=_product_context_payload(updated))
+    if identifiers.get("model_number") and identifiers.get("date_code"):
+        return await _check_saved_product(
+            owner,
+            product_id,
+            updated.get("product_name") or "",
+            updated.get("brand"),
+            identifiers,
+        )
+    missing = []
+    if not identifiers.get("model_number"):
+        missing.append("MODEL <model on label>")
+    if not identifiers.get("date_code"):
+        missing.append("DATE <code on label>")
+    return "Got it. Still need " + " and ".join(missing) + f". Example format: {IDENTIFIER_HINT}."
 
 
 def _product_save_data(
@@ -566,7 +662,12 @@ def _save_receipt_item(
             state="idle",
             payload={"last_product_id": saved["id"]},
         )
-        return {"reply": "That exact receipt item is already saved. I left the existing record unchanged."}
+        return {
+            "reply": (
+                "That exact receipt item is already saved. I left the existing record unchanged.\n"
+                f"{_desk_line(owner)}"
+            )
+        }
     product_payload = {
         "product_id": saved["id"],
         "brand": item.get("brand"),
@@ -579,14 +680,16 @@ def _save_receipt_item(
             "reply": (
                 "Saved the confirmed product details. This receipt name looks abbreviated. "
                 "Send a photo of the package label before I run a CPSC search. "
-                f"Or type {IDENTIFIER_HINT}."
+                f"Or type {IDENTIFIER_HINT}.\n"
+                f"{_desk_line(owner)}"
             )
         }
     set_conversation(owner_handle=owner, state="awaiting_monitor_optin", payload=product_payload)
     return {
         "reply": (
             "Saved the confirmed product details. Should I monitor CPSC recall notices for it? "
-            "Reply MONITOR to opt in or NO to skip."
+            "Reply MONITOR to opt in or NO to skip.\n"
+            f"{_desk_line(owner)}"
         )
     }
 
@@ -660,6 +763,26 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         if lowered in {"help", "commands", "?"}:
             return {"reply": HELP_TEXT}
 
+        if lowered in {"stop", "stop monitoring", "unsubscribe"}:
+            product_id = payload.get("product_id") or payload.get("last_product_id")
+            if not product_id:
+                products = list_owner_products(owner_handle=owner)
+                product_id = products[-1]["id"] if products else None
+            if not product_id:
+                return {"reply": "No saved product to stop monitoring for. Text LIST to see saved items."}
+            try:
+                disabled = disable_monitoring(product_id=product_id, owner_handle=owner)
+            except LookupError:
+                return {"reply": "I couldn't find that saved product. Text LIST and try again."}
+            context = _product_context_payload(disabled)
+            set_conversation(owner_handle=owner, state="idle", payload=context)
+            return {
+                "reply": (
+                    f"Monitoring disabled for {disabled.get('product_name') or 'that product'}. "
+                    "Text MONITOR to opt in again, or HELP for commands."
+                )
+            }
+
         if lowered in {"delete", "delete my data", "forget me", "forget"}:
             deleted = delete_owner_products(owner_handle=owner)
             set_conversation(owner_handle=owner, state="idle", payload={})
@@ -671,7 +794,16 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             }
 
         if lowered == "list":
-            return {"reply": _format_list(list_owner_products(owner_handle=owner))}
+            return {"reply": _format_list(list_owner_products(owner_handle=owner), owner=owner)}
+
+        if lowered in {"desk", "website", "site", "inventory", "my desk"}:
+            return {
+                "reply": (
+                    "Open your phone-friendly evidence desk to see saved receipts, recall matches, "
+                    f"and follow-ups:\n{_desk_url(owner)}\n"
+                    "Tip: text LIST anytime for a quick inventory in chat."
+                )
+            }
 
         if lowered in {"actions", "my actions", "cases"}:
             return {
@@ -906,17 +1038,15 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     if item.get(key)
                 }
                 provenance = _field_provenance(item, "label", payload.get("edited_fields"))
-                updated = update_product_identifiers(
-                    product_id=product_id, owner_handle=owner, updates=identifier_updates,
-                    provenance={key: provenance[key] for key in identifier_updates if key in provenance},
-                )
+                # Persist a clearer label brand/name over abbreviated receipt SKU text.
                 return {
-                    "reply": await _check_saved_product(
+                    "reply": await _apply_typed_identifiers(
                         owner,
                         product_id,
-                        updated["product_name"],
-                        updated.get("brand"),
-                        updated.get("identifiers") or {},
+                        identifier_updates,
+                        brand_update=item.get("brand"),
+                        product_name_update=item.get("product_name"),
+                        provenance={key: provenance[key] for key in identifier_updates if key in provenance},
                     )
                 }
 
@@ -980,14 +1110,21 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         if lowered in {"check", "recheck"}:
             product_id = payload.get("product_id") or payload.get("last_product_id")
             if not product_id:
+                products = list_owner_products(owner_handle=owner)
+                product_id = products[-1]["id"] if products else None
+            if not product_id:
                 return {"reply": "No saved product to check yet. Send a receipt photo first."}
+            product = get_owner_product(product_id=product_id, owner_handle=owner)
+            if not product:
+                return {"reply": "I couldn't find that saved product. Text LIST and try CHECK again."}
+            set_conversation(owner_handle=owner, state="idle", payload=_product_context_payload(product))
             return {
                 "reply": await _check_saved_product(
                     owner,
-                    product_id,
-                    payload.get("product_name") or "",
-                    payload.get("brand"),
-                    payload.get("identifiers") or {},
+                    product["id"],
+                    product.get("product_name") or "",
+                    product.get("brand"),
+                    product.get("identifiers") or {},
                 )
             }
 
@@ -1000,28 +1137,9 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     )
                 }
             parsed = _parse_identifiers(text)
-            if parsed.get("model_number") and parsed.get("date_code"):
-                updates = update_product_identifiers(
-                    product_id=payload["product_id"],
-                    owner_handle=owner,
-                    updates=parsed,
-                )
-                return {
-                    "reply": _verify_mycharge(
-                        owner,
-                        payload["product_id"],
-                        str(updates["identifiers"]["model_number"]),
-                        str(updates["identifiers"]["date_code"]),
-                    )
-                }
-            if parsed.get("model_number") or parsed.get("date_code"):
-                update_product_identifiers(product_id=payload["product_id"], owner_handle=owner, updates=parsed)
-                missing = []
-                if not parsed.get("model_number") and not (payload.get("identifiers") or {}).get("model_number"):
-                    missing.append("MODEL <model on label>")
-                if not parsed.get("date_code") and not (payload.get("identifiers") or {}).get("date_code"):
-                    missing.append("DATE <code on label>")
-                return {"reply": "Got it. Still need " + " and ".join(missing) + f". Example format: {IDENTIFIER_HINT}."}
+            product_id = payload.get("product_id") or payload.get("last_product_id")
+            if product_id and (parsed.get("model_number") or parsed.get("date_code")):
+                return {"reply": await _apply_typed_identifiers(owner, product_id, parsed)}
             return {
                 "reply": (
                     "Please send a clear product-label photo, or type identifiers from the package as "
@@ -1031,9 +1149,13 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
 
         if state == "awaiting_follow_up":
             if lowered in {"done", "complete", "completed"}:
-                complete_latest_follow_up(product_id=payload["product_id"])
-                set_conversation(owner_handle=owner, state="idle", payload={"last_product_id": payload["product_id"]})
-                return {"reply": "Thanks, I recorded that follow-up as complete."}
+                product_id = payload.get("product_id") or payload.get("last_product_id")
+                if product_id:
+                    complete_latest_follow_up(product_id=product_id)
+                product = get_owner_product(product_id=product_id, owner_handle=owner) if product_id else None
+                context = _product_context_payload(product) if product else {"last_product_id": product_id}
+                set_conversation(owner_handle=owner, state="idle", payload=context)
+                return {"reply": "Thanks, I recorded that follow-up as complete. Text CHECK anytime to re-check this product."}
             return {"reply": "When you've handled the remedy, reply DONE and I'll record it."}
 
         status_commands = {
@@ -1070,31 +1192,27 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             product_id = payload.get("product_id") or payload.get("last_product_id")
             if product_id:
                 enable_monitoring(product_id=product_id, owner_handle=owner)
-                set_conversation(owner_handle=owner, state="awaiting_label", payload={**payload, "product_id": product_id})
+                product = get_owner_product(product_id=product_id, owner_handle=owner)
+                if not product:
+                    return {"reply": "I couldn't find that saved product. Text LIST and try MONITOR again."}
+                product_payload = _product_context_payload(product)
+                set_conversation(owner_handle=owner, state="awaiting_label", payload=product_payload)
                 return {
                     "reply": "Your monitoring opt-in is saved. Checking CPSC now. "
                     + await _check_saved_product(
                         owner,
-                        product_id,
-                        payload.get("product_name", ""),
-                        payload.get("brand"),
-                        payload.get("identifiers") or {},
+                        product["id"],
+                        product.get("product_name") or "",
+                        product.get("brand"),
+                        product.get("identifiers") or {},
                     )
                 }
 
-        # Typed identifiers while idle, if a product is pending verification.
+        # Typed identifiers while idle: merge across messages, then candidate-aware check.
         parsed = _parse_identifiers(text)
         product_id = payload.get("product_id") or payload.get("last_product_id")
-        if product_id and parsed.get("model_number") and parsed.get("date_code"):
-            updates = update_product_identifiers(product_id=product_id, owner_handle=owner, updates=parsed)
-            return {
-                "reply": _verify_mycharge(
-                    owner,
-                    product_id,
-                    str(updates["identifiers"]["model_number"]),
-                    str(updates["identifiers"]["date_code"]),
-                )
-            }
+        if product_id and (parsed.get("model_number") or parsed.get("date_code")):
+            return {"reply": await _apply_typed_identifiers(owner, product_id, parsed)}
 
         set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
         return {

@@ -65,6 +65,7 @@ export type DashboardPayload = {
   follow_ups: FollowUp[];
   recovery_cases: RecoveryCase[];
   persistence: string;
+  owner_handle?: string | null;
   demo_notice: {
     title: string;
     url: string;
@@ -73,6 +74,23 @@ export type DashboardPayload = {
     remedy: string;
     hazard: string;
     historical_fixture: boolean;
+  };
+  generated_at: string;
+};
+
+export type PurchaseInsights = {
+  source: string;
+  snowflake_enabled: boolean;
+  used_cortex: boolean;
+  summary: string;
+  metrics: {
+    product_count: number;
+    monitoring_count: number;
+    affected_count: number;
+    possible_match_count: number;
+    open_recovery_count: number;
+    due_within_30_days: number;
+    overdue_count: number;
   };
   generated_at: string;
 };
