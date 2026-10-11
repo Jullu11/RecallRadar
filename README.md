@@ -24,7 +24,7 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    - `BACKEND_INTERNAL_TOKEN`: a private random string shared only by the local gateway and API.
    - `ALLOWED_SENDER_IDS`: your exact sender ID as Spectrum delivers it. Leave no blank allowlist in a working gateway; empty denies all senders. Separate multiple exact IDs with commas.
 
-3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor.
+3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor. Migration `0005` creates the private receipt image bucket and metadata table.
 
 4. Start the API and gateway in separate terminals from the repository root:
 
@@ -64,7 +64,7 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Spectrum Cloud receives and sends direct iMessages through the Node gateway; FastAPI owns product and recall behavior.
 - Gemini extracts product identifiers from receipt and label images. Unknown fields remain unknown and require confirmation.
 - Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
-- The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. It does not retain uploaded receipt or label image bytes.
+- The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. Receipt originals are retained in a private Supabase Storage bucket when persistence is configured; demo mode keeps them only in memory until the process exits. Receipt images are deduplicated per sender. Label images are still used for extraction only.
 - Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
 - Supabase stores confirmed product details, opt-in state, match evidence, follow-up status, and price-watch records.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
@@ -75,7 +75,7 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 
-Product records are saved only after the user confirms the extracted details. Monitoring is a separate opt-in. Receipt and label image bytes are passed to Gemini for extraction and are not written to Supabase. The MVP does not yet run scheduled repeat checks; it performs an initial check and records the user's follow-up response. Text `delete` to remove saved product records, conversation state, and message deduplication records.
+Product records are saved only after the user confirms the extracted details. Monitoring is a separate opt-in. Receipt image originals are stored in private Supabase Storage; label image bytes are passed to Gemini for extraction and are not retained. Text `delete` to remove saved product records, private receipt images, conversation state, and message deduplication records. The image bucket and metadata table require migration `0005` before using image retention with Supabase.
 
 ## Local setup troubleshooting
 

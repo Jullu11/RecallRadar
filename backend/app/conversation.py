@@ -31,6 +31,7 @@ from .storage import (
     pause_price_watch,
     record_price_check,
     save_confirmed_product,
+    save_receipt_image,
     save_match_evidence,
     set_conversation,
     set_recovery_case_status,
@@ -649,6 +650,23 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 return {"reply": "Please send a receipt first so I know which household product this label belongs to."}
             raw = base64.b64decode(image["base64"], validate=True)
             receipt_fingerprint = hashlib.sha256(raw).hexdigest() if source_type == "receipt" else None
+            if receipt_fingerprint:
+                try:
+                    await run_in_threadpool(
+                        save_receipt_image,
+                        owner_handle=owner,
+                        fingerprint=receipt_fingerprint,
+                        image_bytes=raw,
+                        mime_type=image["mime_type"],
+                    )
+                except Exception as error:
+                    print(f"Receipt image storage failed: {type(error).__name__}", flush=True)
+                    return {
+                        "reply": (
+                            "I couldn't securely save that receipt photo, so I haven't processed it. "
+                            "Please try again later."
+                        )
+                    }
             try:
                 extracted = await run_in_threadpool(extract_products, raw, image["mime_type"], source_type)
             except Exception as error:
@@ -995,7 +1013,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             saved_count = len(saved_ids) - duplicates
             return {"reply": (
                 f"Saved {saved_count} new item(s); {duplicates} exact receipt item(s) were already saved; "
-                f"{unreadable} item(s) had no readable product name and were skipped. The receipt image was not retained. "
+                f"{unreadable} item(s) had no readable product name and were skipped. The receipt image is retained securely. "
                 "Text LIST, then CHECK 2 to check an item or MONITOR 2 to opt in to monitoring."
             )}
 

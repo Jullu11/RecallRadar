@@ -34,6 +34,7 @@ class _MemoryStore:
         self.follow_ups: list[dict[str, Any]] = []
         self.recovery_cases: dict[str, dict[str, Any]] = {}
         self.price_watches: dict[str, dict[str, Any]] = {}
+        self.receipt_images: dict[tuple[str, str], dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
 
@@ -62,7 +63,7 @@ def save_confirmed_product(
     receipt_fingerprint: str | None = None,
     receipt_item_index: int | None = None,
 ) -> dict[str, Any]:
-    """Store only user-confirmed structured fields; uploaded images are not stored here."""
+    """Store only user-confirmed structured product fields."""
     if uses_memory_store():
         row = {
             "id": str(uuid.uuid4()),
@@ -110,6 +111,35 @@ def save_confirmed_product(
         )
         if existing.data:
             return {**existing.data[0], "_duplicate": True}
+
+
+def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: bytes, mime_type: str) -> None:
+    """Retain a receipt image in private storage, deduplicated per sender and image."""
+    suffix = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime_type)
+    if not suffix:
+        raise ValueError("Unsupported receipt image type.")
+    owner_key = __import__("hashlib").sha256(owner_handle.encode("utf-8")).hexdigest()
+    path = f"{owner_key}/{fingerprint}.{suffix}"
+    if uses_memory_store():
+        with _MEMORY.lock:
+            _MEMORY.receipt_images[(owner_handle, fingerprint)] = {
+                "bytes": bytes(image_bytes), "mime_type": mime_type, "path": path,
+            }
+        return
+
+    client = get_supabase()
+    try:
+        client.storage.from_("receipt-images").upload(
+            path, image_bytes,
+            file_options={"content-type": mime_type, "upsert": "true"},
+        )
+    except Exception as error:
+        if "already exists" not in str(error).casefold() and "duplicate" not in str(error).casefold():
+            raise
+    client.table("receipt_images").upsert(
+        {"owner_handle": owner_handle, "fingerprint": fingerprint, "storage_path": path, "mime_type": mime_type},
+        on_conflict="owner_handle,fingerprint",
+    ).execute()
 
     try:
         result = client.table("products").insert(
@@ -423,12 +453,20 @@ def delete_owner_products(*, owner_handle: str) -> int:
                 if row["product_id"] not in product_ids
             }
             _MEMORY.conversations.pop(owner_handle, None)
+            _MEMORY.receipt_images = {
+                key: row for key, row in _MEMORY.receipt_images.items() if key[0] != owner_handle
+            }
             _MEMORY.photon_events = {
                 eid: row for eid, row in _MEMORY.photon_events.items() if row["owner_handle"] != owner_handle
             }
             return len(product_ids)
 
     client = get_supabase()
+    receipt_assets = client.table("receipt_images").select("storage_path").eq("owner_handle", owner_handle).execute()
+    paths = [row["storage_path"] for row in (receipt_assets.data or [])]
+    if paths:
+        client.storage.from_("receipt-images").remove(paths)
+    client.table("receipt_images").delete().eq("owner_handle", owner_handle).execute()
     result = client.table("products").select("id").eq("owner_handle", owner_handle).execute()
     count = len(result.data or [])
     client.table("products").delete().eq("owner_handle", owner_handle).execute()
@@ -761,6 +799,7 @@ def reset_memory_store() -> None:
         _MEMORY.follow_ups.clear()
         _MEMORY.recovery_cases.clear()
         _MEMORY.price_watches.clear()
+        _MEMORY.receipt_images.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
 
