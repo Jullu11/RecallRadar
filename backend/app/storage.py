@@ -33,6 +33,7 @@ class _MemoryStore:
         self.matches: dict[tuple[str, str], dict[str, Any]] = {}
         self.follow_ups: list[dict[str, Any]] = []
         self.recovery_cases: dict[str, dict[str, Any]] = {}
+        self.price_watches: dict[str, dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
 
@@ -301,6 +302,108 @@ def set_recovery_case_status(
     return True
 
 
+def create_price_watch(
+    *, owner_handle: str, product_id: str, asin: str, product_url: str, target_price: float
+) -> dict[str, Any]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            product = _MEMORY.products.get(product_id)
+            if not product or product["owner_handle"] != owner_handle:
+                raise LookupError("Product was not found for this message sender.")
+            row = {
+                "id": str(uuid.uuid4()), "owner_handle": owner_handle, "product_id": product_id,
+                "provider": "keepa", "asin": asin, "product_url": product_url,
+                "target_price": round(target_price, 2), "current_price": None, "provider_title": None,
+                "last_checked_at": None, "check_error": None, "is_active": True,
+                "created_at": _now(), "updated_at": _now(),
+            }
+            _MEMORY.price_watches[row["id"]] = row
+            return copy.deepcopy(row)
+
+    client = get_supabase()
+    product = (
+        client.table("products").select("id").eq("id", product_id)
+        .eq("owner_handle", owner_handle).limit(1).execute()
+    )
+    if not product.data:
+        raise LookupError("Product was not found for this message sender.")
+    result = client.table("price_watches").insert({
+        "product_id": product_id, "owner_handle": owner_handle, "provider": "keepa",
+        "asin": asin, "product_url": product_url, "target_price": round(target_price, 2),
+    }).execute()
+    return result.data[0]
+
+
+def list_owner_price_watches(*, owner_handle: str) -> list[dict[str, Any]]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            rows = [copy.deepcopy(row) for row in _MEMORY.price_watches.values() if row["owner_handle"] == owner_handle]
+        rows.sort(key=lambda row: row["created_at"])
+        return rows
+    result = (
+        get_supabase().table("price_watches")
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
+        .eq("owner_handle", owner_handle).order("created_at").execute()
+    )
+    return result.data or []
+
+
+def list_active_price_watches(*, limit: int = 25) -> list[dict[str, Any]]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            rows = [copy.deepcopy(row) for row in _MEMORY.price_watches.values() if row.get("is_active")]
+        rows.sort(key=lambda row: row.get("last_checked_at") or row.get("created_at") or "")
+        return rows[:limit]
+    result = (
+        get_supabase().table("price_watches")
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
+        .eq("is_active", True).order("last_checked_at", desc=False).limit(limit).execute()
+    )
+    return result.data or []
+
+
+def record_price_check(
+    *, owner_handle: str, watch_id: str, current_price: float | None,
+    provider_title: str | None = None, error: str | None = None,
+) -> dict[str, Any] | None:
+    now = _now()
+    values = {"check_error": error[:250] if error else None, "updated_at": now}
+    if current_price is not None:
+        values.update({
+            "current_price": round(current_price, 2),
+            "provider_title": provider_title,
+            "last_checked_at": now,
+        })
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.price_watches.get(watch_id)
+            if not row or row["owner_handle"] != owner_handle:
+                return None
+            row.update(values)
+            return copy.deepcopy(row)
+    result = (
+        get_supabase().table("price_watches").update(values)
+        .eq("id", watch_id).eq("owner_handle", owner_handle).execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def pause_price_watch(*, owner_handle: str, watch_id: str) -> bool:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.price_watches.get(watch_id)
+            if not row or row["owner_handle"] != owner_handle:
+                return False
+            row["is_active"] = False
+            row["updated_at"] = _now()
+            return True
+    result = (
+        get_supabase().table("price_watches").update({"is_active": False, "updated_at": _now()})
+        .eq("id", watch_id).eq("owner_handle", owner_handle).execute()
+    )
+    return bool(result.data)
+
+
 def delete_owner_products(*, owner_handle: str) -> int:
     """Delete an owner's product records; related evidence cascades in Postgres."""
     if uses_memory_store():
@@ -313,6 +416,10 @@ def delete_owner_products(*, owner_handle: str) -> int:
             _MEMORY.recovery_cases = {
                 case_id: row
                 for case_id, row in _MEMORY.recovery_cases.items()
+                if row["product_id"] not in product_ids
+            }
+            _MEMORY.price_watches = {
+                watch_id: row for watch_id, row in _MEMORY.price_watches.items()
                 if row["product_id"] not in product_ids
             }
             _MEMORY.conversations.pop(owner_handle, None)
@@ -653,6 +760,7 @@ def reset_memory_store() -> None:
         _MEMORY.matches.clear()
         _MEMORY.follow_ups.clear()
         _MEMORY.recovery_cases.clear()
+        _MEMORY.price_watches.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
 
@@ -681,12 +789,17 @@ def get_dashboard_snapshot() -> dict[str, Any]:
                 (copy.deepcopy(row) for row in _MEMORY.recovery_cases.values()),
                 key=lambda item: (item.get("due_date") or "9999-12-31", item.get("created_at") or ""),
             )
+            price_watches = sorted(
+                (copy.deepcopy(row) for row in _MEMORY.price_watches.values()),
+                key=lambda item: item.get("created_at") or "",
+            )
         return {
             "products": products,
             "notices": notices,
             "matches": matches,
             "follow_ups": follow_ups,
             "recovery_cases": recovery_cases,
+            "price_watches": price_watches,
             "persistence": "memory",
         }
 
@@ -740,11 +853,23 @@ def get_dashboard_snapshot() -> dict[str, Any]:
         if product_ids
         else []
     ) or []
+    price_watches = (
+        client.table("price_watches")
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
+        .in_("product_id", product_ids)
+        .order("created_at")
+        .limit(200)
+        .execute()
+        .data
+        if product_ids
+        else []
+    ) or []
     return {
         "products": products,
         "notices": notices,
         "matches": matches,
         "follow_ups": follow_ups,
         "recovery_cases": recovery_cases,
+        "price_watches": price_watches,
         "persistence": "supabase",
     }

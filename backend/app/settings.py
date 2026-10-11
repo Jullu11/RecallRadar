@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    keepa_api_key: str | None = None
     supabase_url: str | None = None
     supabase_service_role_key: str | None = None
     spectrum_project_id: str | None = None

@@ -322,6 +322,43 @@ button {
   margin: 0.6rem 0 0;
 }
 
+.price-watch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line, rgba(30, 41, 59, 0.12));
+  border-radius: 0.7rem;
+  background: #fff;
+}
+
+.price-watch-row > div:first-child,
+.price-watch-actions {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+}
+
+.price-watch-row span,
+.price-watch-actions {
+  color: var(--muted, #64748b);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.price-watch-actions a {
+  color: var(--signal-deep);
+  font-weight: 600;
+}
+
+@media (max-width: 640px) {
+  .price-watch-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 .product-list,
 .evidence-list {
   list-style: none;

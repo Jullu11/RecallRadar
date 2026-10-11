@@ -58,12 +58,27 @@ export type RecoveryCase = {
   completed_at: string | null;
 };
 
+export type PriceWatch = {
+  id: string;
+  product_id: string;
+  provider: "keepa";
+  asin: string;
+  product_url: string;
+  target_price: number;
+  current_price: number | null;
+  provider_title: string | null;
+  last_checked_at: string | null;
+  check_error: string | null;
+  is_active: boolean;
+};
+
 export type DashboardPayload = {
   products: Product[];
   matches: MatchRow[];
   notices: NoticeRow[];
   follow_ups: FollowUp[];
   recovery_cases: RecoveryCase[];
+  price_watches: PriceWatch[];
   persistence: string;
   demo_notice: {
     title: string;

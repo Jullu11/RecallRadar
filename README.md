@@ -66,11 +66,12 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
 - The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. It does not retain uploaded receipt or label image bytes.
 - Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
-- Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
+- Supabase stores confirmed product details, opt-in state, match evidence, follow-up status, and price-watch records.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
 - `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. These are in-app/on-demand reminders; scheduled outbound messages are not configured.
 - `PACKET <action number> FOR <merchant>` drafts a copyable support message from the saved product details and the date the user entered. Missing order, payment, and issue details remain placeholders; the packet does not assert merchant policy or eligibility and is not submitted or saved as a separate record.
+- `WATCH PRICE <item> <Amazon URL> BELOW <$amount>` saves an Amazon.com price target. `PRICE CHECK <watch>` fetches the latest recorded Amazon price through Keepa; `PRICE WATCHES` lists saved checks and `STOP PRICE <watch>` pauses one. Add `KEEPA_API_KEY` for checks. Checks are manual unless a deployed scheduler calls the protected `POST /api/price-watches/run` endpoint. This version does not send price-drop iMessages.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 
@@ -81,5 +82,6 @@ Product records are saved only after the user confirms the extracted details. Mo
 - If the gateway exits at startup, check `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET`, and `ALLOWED_SENDER_IDS` in `.env`.
 - If the API starts but image extraction fails, check `GEMINI_API_KEY`.
 - If product saves fail, confirm the SQL migration was applied and the Supabase URL/service-role key are correct.
+- If Amazon price checks fail because the API key is missing, add `KEEPA_API_KEY` to the backend `.env`. Keepa access requires an API plan; checks consume provider tokens.
 - If Photon messages do not arrive, check the gateway output, Spectrum project credentials, and the exact sender ID in `ALLOWED_SENDER_IDS`.
 - The API health route does not need external credentials; Gemini, Supabase, Spectrum, and the CPSC service do.

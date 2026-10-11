@@ -13,18 +13,23 @@ from starlette.concurrency import run_in_threadpool
 from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, ProductCheck, match_product
+from .prices import amazon_asin_from_url, fetch_amazon_price
 from .storage import (
     claim_photon_event,
     complete_latest_follow_up,
     create_follow_up,
+    create_price_watch,
     create_recovery_case,
     delete_owner_products,
     enable_monitoring,
     get_conversation,
     list_owner_products,
+    list_owner_price_watches,
     list_owner_recovery_cases,
     mark_photon_event_failed,
     mark_photon_event_processed,
+    pause_price_watch,
+    record_price_check,
     save_confirmed_product,
     save_match_evidence,
     set_conversation,
@@ -68,6 +73,8 @@ HELP_TEXT = (
     "• ACTIONS — list return, warranty, and price-adjustment cases\n"
     "• REMINDERS — show overdue actions and dates due in the next 30 days\n"
     "• PACKET <action number> FOR <merchant> — draft a claim message to review and copy\n"
+    "• WATCH PRICE <item> <Amazon URL> BELOW <$amount> — set a price target\n"
+    "• PRICE WATCHES / PRICE CHECK <watch> / STOP PRICE <watch>\n"
     "• CLOSE ACTION <number> / DISMISS ACTION <number> — update a case\n"
     "• EDIT <field> <value> — correct extracted fields before confirming\n"
     f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
@@ -396,6 +403,33 @@ def _claim_packet(case: dict[str, Any], product: dict[str, Any], merchant: str) 
     )
 
 
+def _format_price_watches(watches: list[dict[str, Any]], products: list[dict[str, Any]]) -> str:
+    if not watches:
+        return "No price watches yet. Text WATCH PRICE <item> <Amazon URL> BELOW <$amount> to add one."
+    products_by_id = {product["id"]: product for product in products}
+    lines = []
+    for index, watch in enumerate(watches, start=1):
+        product = products_by_id.get(watch.get("product_id"), {})
+        title = watch.get("provider_title") or product.get("product_name") or f"Amazon {watch.get('asin')}"
+        target = float(watch.get("target_price") or 0)
+        current_value = watch.get("current_price")
+        current = float(current_value) if current_value is not None else None
+        state = "paused" if not watch.get("is_active") else (
+            "not checked yet" if current is None
+            else "target reached" if current <= target
+            else "target not reached"
+        )
+        checked = watch.get("last_checked_at")
+        current_text = f"latest ${current:.2f}" if current is not None else "no successful check yet"
+        lines.append(
+            f"{index}. {title} · target ${target:.2f} · {current_text} · {state}"
+            + (f" · checked {checked}" if checked else "")
+        )
+        if watch.get("check_error") and watch.get("is_active"):
+            lines.append(f"   Latest check issue: {watch['check_error']}")
+    return "Amazon price watches (provider data may lag the live listing):\n" + "\n".join(lines)
+
+
 def _fixture_transparency(used_fixture: bool) -> str:
     if not used_fixture:
         return ""
@@ -665,7 +699,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             set_conversation(owner_handle=owner, state="idle", payload={})
             return {
                 "reply": (
-                    f"Deleted {deleted} saved product record(s), linked match evidence and recovery actions, "
+                    f"Deleted {deleted} saved product record(s), linked match evidence, recovery actions, and price watches, "
                     "conversation state, and message deduplication records."
                 )
             }
@@ -686,6 +720,94 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 "reply": _format_reminders(
                     list_owner_recovery_cases(owner_handle=owner),
                     list_owner_products(owner_handle=owner),
+                )
+            }
+
+        if lowered in {"price watches", "price watch", "my price watches"}:
+            return {"reply": _format_price_watches(
+                list_owner_price_watches(owner_handle=owner), list_owner_products(owner_handle=owner)
+            )}
+
+        watch_command = re.fullmatch(
+            r"WATCH PRICE\s+(\d{1,2})\s+(https://\S+)\s+BELOW\s+\$?(\d+(?:\.\d{1,2})?)",
+            text,
+            re.IGNORECASE,
+        )
+        if watch_command:
+            products = list_owner_products(owner_handle=owner)
+            item_number = int(watch_command.group(1))
+            if item_number < 1 or item_number > len(products):
+                return {"reply": f"That item number is out of range. Text LIST to see items 1–{len(products)}."}
+            try:
+                asin = amazon_asin_from_url(watch_command.group(2))
+            except ValueError as error:
+                return {"reply": str(error)}
+            target_price = float(watch_command.group(3))
+            if target_price <= 0 or target_price > 100_000:
+                return {"reply": "Set a target price greater than $0 and no more than $100,000."}
+            product = products[item_number - 1]
+            created_watch = create_price_watch(
+                owner_handle=owner, product_id=product["id"], asin=asin,
+                product_url=f"https://www.amazon.com/dp/{asin}", target_price=target_price,
+            )
+            watch_number = next(
+                (index for index, watch in enumerate(list_owner_price_watches(owner_handle=owner), start=1)
+                 if watch["id"] == created_watch["id"]),
+                1,
+            )
+            return {
+                "reply": (
+                    f"Added an Amazon.com price watch for {product.get('product_name') or 'that product'}, "
+                    f"target ${target_price:.2f}. Text PRICE CHECK {watch_number} to check it now or PRICE WATCHES to see all watches. "
+                    "Checks are manual in this version; no background checks or price-drop messages are running."
+                )
+            }
+
+        stop_price = re.fullmatch(r"STOP PRICE\s+(\d{1,2})", text, re.IGNORECASE)
+        if stop_price:
+            watches = list_owner_price_watches(owner_handle=owner)
+            watch_number = int(stop_price.group(1))
+            if watch_number < 1 or watch_number > len(watches):
+                return {"reply": "That watch number is out of range. Text PRICE WATCHES to see your watches."}
+            if not pause_price_watch(owner_handle=owner, watch_id=watches[watch_number - 1]["id"]):
+                return {"reply": "I couldn't stop that price watch. Text PRICE WATCHES and try again."}
+            return {"reply": f"Price watch {watch_number} is paused. Text PRICE WATCHES to review the list."}
+
+        price_check = re.fullmatch(r"PRICE CHECK(?:\s+(\d{1,2}))?", text, re.IGNORECASE)
+        if price_check:
+            watches = list_owner_price_watches(owner_handle=owner)
+            if not watches:
+                return {"reply": "No price watches yet. Text WATCH PRICE <item> <Amazon URL> BELOW <$amount> to add one."}
+            watch_number = int(price_check.group(1)) if price_check.group(1) else 1
+            if watch_number < 1 or watch_number > len(watches):
+                return {"reply": f"That watch number is out of range. Text PRICE WATCHES to see watches 1–{len(watches)}."}
+            watch = watches[watch_number - 1]
+            if not watch.get("is_active"):
+                return {"reply": "That price watch is paused. Text PRICE WATCHES to select an active watch."}
+            try:
+                current = await run_in_threadpool(fetch_amazon_price, watch["asin"])
+            except (RuntimeError, LookupError) as error:
+                record_price_check(owner_handle=owner, watch_id=watch["id"], current_price=None, error=str(error))
+                return {"reply": str(error)}
+            except Exception as error:
+                print(f"Keepa price check failed: {type(error).__name__}", flush=True)
+                record_price_check(
+                    owner_handle=owner, watch_id=watch["id"], current_price=None,
+                    error="Price provider unavailable; try again later.",
+                )
+                return {"reply": "The price provider is unavailable right now. No current price was recorded; try again later."}
+            updated = record_price_check(
+                owner_handle=owner, watch_id=watch["id"], current_price=current["price"],
+                provider_title=current.get("title"),
+            )
+            if not updated:
+                return {"reply": "I couldn't find that saved price watch."}
+            state_text = "Your target is reached." if current["price"] <= float(watch["target_price"]) else "Your target has not been reached."
+            return {
+                "reply": (
+                    f"Keepa's latest recorded Amazon price for {current.get('title') or watch['asin']} is "
+                    f"${current['price']:.2f} USD. Target: ${float(watch['target_price']):.2f}. {state_text} "
+                    "Provider data can lag the listing. Text PRICE WATCHES to review saved checks."
                 )
             }
 

@@ -15,7 +15,12 @@ from .cpsc import search_recalls
 from .extraction import extract_products
 from .matcher import NOTICE, MatchResult, ProductCheck, match_product, query_matches_demo_notice
 from .settings import get_settings
-from .storage import get_dashboard_snapshot, uses_memory_store
+from .storage import (
+    get_dashboard_snapshot,
+    list_active_price_watches,
+    record_price_check,
+    uses_memory_store,
+)
 
 
 app = FastAPI(
@@ -62,6 +67,46 @@ def dashboard() -> dict:
         "demo_notice": NOTICE,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.post("/api/price-watches/run")
+async def run_price_watches(x_lodestone_internal: str | None = Header(default=None)) -> dict[str, int]:
+    """Internal scheduler hook; checks a bounded batch and updates dashboard status."""
+    expected = get_settings().backend_internal_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="The internal scheduler token is not configured.")
+    if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    from .prices import fetch_amazon_price
+
+    watches = list_active_price_watches(limit=25)
+    checked = 0
+    failed = 0
+    for watch in watches:
+        try:
+            price = await run_in_threadpool(fetch_amazon_price, watch["asin"])
+            record_price_check(
+                owner_handle=watch["owner_handle"],
+                watch_id=watch["id"],
+                current_price=price["price"],
+                provider_title=price.get("title"),
+            )
+            checked += 1
+        except (RuntimeError, LookupError) as error:
+            record_price_check(
+                owner_handle=watch["owner_handle"], watch_id=watch["id"],
+                current_price=None, error=str(error),
+            )
+            failed += 1
+        except Exception as error:
+            print(f"Scheduled Keepa check failed: {type(error).__name__}", flush=True)
+            record_price_check(
+                owner_handle=watch["owner_handle"], watch_id=watch["id"],
+                current_price=None, error="Price provider unavailable; try again later.",
+            )
+            failed += 1
+    return {"checked": checked, "failed": failed}
 
 
 @app.post("/api/extract")

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { DashboardPayload, MatchRow, Product, RecoveryCase } from "./types";
+import type { DashboardPayload, MatchRow, Product, RecoveryCase, PriceWatch } from "./types";
 
 type View = "home" | "desk";
 
@@ -73,6 +73,8 @@ export default function App() {
     if (!data) return [] as RecoveryCase[];
     return data.recovery_cases.filter((item) => item.status === "open");
   }, [data]);
+
+  const priceWatches = useMemo(() => data?.price_watches ?? ([] as PriceWatch[]), [data]);
 
   const deadlineLabel = (dueDate: string) => {
     const today = new Date();
@@ -188,6 +190,47 @@ export default function App() {
             </ul>
           )}
           <p className="reminder-note">Dates come from you. Lodestone does not verify retailer terms or send proactive messages yet.</p>
+        </section>
+
+        <section className="reminder-panel" aria-label="Amazon price watches">
+          <div className="reminder-heading">
+            <div>
+              <p className="eyebrow">Price recovery</p>
+              <h3 className="panel-title">Amazon price watches</h3>
+            </div>
+            <span>{priceWatches.filter((watch) => watch.is_active).length} active</span>
+          </div>
+          {!priceWatches.length ? (
+            <p className="empty">No price watches yet. Add one by texting WATCH PRICE with an item number, Amazon product link, and target price.</p>
+          ) : (
+            <ul className="reminder-list">
+              {priceWatches.map((watch, index) => {
+                const product = data?.products.find((candidate) => candidate.id === watch.product_id);
+                const reached = watch.current_price !== null && watch.current_price <= watch.target_price;
+                return (
+                  <li key={watch.id}>
+                    <div className="price-watch-row">
+                      <div>
+                        <strong>{watch.provider_title || (product ? productTitle(product) : `Amazon ${watch.asin}`)}</strong>
+                        <span>
+                          {watch.current_price === null
+                            ? "Not checked yet"
+                            : `Latest recorded $${watch.current_price.toFixed(2)} · target $${watch.target_price.toFixed(2)} · ${reached ? "target reached" : "target not reached"}`}
+                        </span>
+                        <span>{watch.is_active ? "Active" : "Paused"}{watch.last_checked_at ? ` · checked ${new Date(watch.last_checked_at).toLocaleString()}` : ""}</span>
+                        {watch.check_error ? <span>{watch.check_error}</span> : null}
+                      </div>
+                      <div className="price-watch-actions">
+                        <a href={watch.product_url} target="_blank" rel="noreferrer">Open Amazon listing</a>
+                        {watch.is_active ? <span>Text PRICE CHECK {index + 1} to refresh</span> : null}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          <p className="reminder-note">Amazon.com only. Prices come from Keepa’s latest recorded data and may lag. Checks are manual by default; a deployed scheduler can call the protected check endpoint. No price-drop iMessages are sent.</p>
         </section>
 
         <div className="desk-grid">
