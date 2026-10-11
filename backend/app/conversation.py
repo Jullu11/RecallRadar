@@ -48,7 +48,8 @@ class PhotonMessage(BaseModel):
 IDENTIFIER_HINT = "MODEL <model on label> DATE <code on label>"
 
 HELP_TEXT = (
-    "RecallRadar checks household products against CPSC recall notices.\n"
+    "Lodestone: Every purchase, on record. Save receipts for the moments they matter.\n"
+    "Recall checks are the first feature; warranty, return, and price-refund tools are planned.\n"
     "Commands:\n"
     "• Send a receipt photo to add a product\n"
     "• YES / NO — confirm extracted details\n"
@@ -633,7 +634,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
         return {
             "reply": (
-                "Hi, I'm RecallRadar. Send a receipt photo to add a household product. "
+                "Hi, I'm Lodestone: Every purchase, on record. Send a receipt photo to save a household product. "
                 "I'll show what I read for confirmation before saving it, then ask before monitoring CPSC notices. "
                 "Text HELP for commands."
             )

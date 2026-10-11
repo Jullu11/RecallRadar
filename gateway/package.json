@@ -1,5 +1,5 @@
 {
-  "name": "recall-radar-spectrum-gateway",
+  "name": "lodestone-spectrum-gateway",
   "private": true,
   "type": "module",
   "scripts": {

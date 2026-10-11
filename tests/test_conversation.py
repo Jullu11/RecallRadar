@@ -46,7 +46,7 @@ class ConversationTests(unittest.TestCase):
 
     def test_help_does_not_leak_affected_identifiers(self) -> None:
         help_reply = self._send("HELP")
-        self.assertIn("RecallRadar", help_reply)
+        self.assertIn("Lodestone", help_reply)
         self.assertIn(IDENTIFIER_HINT, help_reply)
         self.assertNotIn("AO10FK-A", help_reply)
         self.assertNotIn("1521", help_reply)

@@ -67,17 +67,19 @@ export default function App() {
   if (view === "home") {
     return (
       <div className="page">
-        <section className="hero" aria-label="RecallRadar home">
+        <section className="hero" aria-label="Lodestone home">
           <div className="hero-media" aria-hidden="true" />
           <div className="hero-top">
-            <div className="brand">RecallRadar</div>
-            <div className="live-dot">iMessage agent live</div>
+            <div className="brand">Lodestone</div>
+            <div className="live-dot">Recall checks in preview</div>
           </div>
           <div className="hero-copy">
-            <h1>Know if the product in your home is actually recalled.</h1>
+            <p className="eyebrow">Every purchase, on record.</p>
+            <h1>Save the receipt once. Put it to work later.</h1>
             <p>
-              Text a receipt or label. RecallRadar extracts identifiers, checks official CPSC evidence, and
-              tracks the next step.
+              Keep proof of what you bought for warranty claims, recalls, returns, price refunds, and other ways
+              to recover money. Lodestone starts with product recall checks; more purchase recovery tools are
+              planned.
             </p>
             <div className="cta-row">
               <button className="btn btn-primary" type="button" onClick={() => setView("desk")}>
@@ -98,8 +100,8 @@ export default function App() {
       <main className="desk">
         <header className="desk-header">
           <div>
-            <p className="eyebrow">RecallRadar</p>
-            <h2>Evidence desk</h2>
+            <p className="eyebrow">Lodestone</p>
+            <h2>Recall evidence desk</h2>
           </div>
           <div className="desk-meta">
             <div>{data ? `Updated ${new Date(data.generated_at).toLocaleString()}` : "Loading…"}</div>
