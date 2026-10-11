@@ -24,7 +24,7 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    - `BACKEND_INTERNAL_TOKEN`: a private random string shared only by the local gateway and API.
    - `ALLOWED_SENDER_IDS`: your exact sender ID as Spectrum delivers it. Leave no blank allowlist in a working gateway; empty denies all senders. Separate multiple exact IDs with commas.
 
-3. Apply [`supabase/migrations/0001_initial_schema.sql`](supabase/migrations/0001_initial_schema.sql) to your Supabase project using its SQL editor.
+3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor.
 
 4. Start the API and gateway in separate terminals from the repository root:
 
@@ -63,8 +63,12 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 
 - Spectrum Cloud receives and sends direct iMessages through the Node gateway; FastAPI owns product and recall behavior.
 - Gemini extracts product identifiers from receipt and label images. Unknown fields remain unknown and require confirmation.
+- Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
+- The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. It does not retain uploaded receipt or label image bytes.
+- Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
 - Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
+- Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 

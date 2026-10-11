@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -16,15 +17,18 @@ from .storage import (
     claim_photon_event,
     complete_latest_follow_up,
     create_follow_up,
+    create_recovery_case,
     delete_owner_products,
     enable_monitoring,
     get_conversation,
     list_owner_products,
+    list_owner_recovery_cases,
     mark_photon_event_failed,
     mark_photon_event_processed,
     save_confirmed_product,
     save_match_evidence,
     set_conversation,
+    set_recovery_case_status,
     update_product_identifiers,
     update_product_status,
 )
@@ -53,10 +57,17 @@ HELP_TEXT = (
     "Commands:\n"
     "• Send a receipt photo to add a product\n"
     "• YES / NO — confirm extracted details\n"
-    "• MONITOR / NO — opt in or skip monitoring\n"
+    "• MONITOR [number] / NO — opt in or skip monitoring\n"
     "• LIST — show saved products\n"
-    "• CHECK — recheck the latest product\n"
+    "• CHECK [number] — check the latest product or a numbered item\n"
     "• LABEL — request a label photo for identifiers\n"
+    "• RETURN BY YYYY-MM-DD — track a return deadline you confirm\n"
+    "• WARRANTY UNTIL YYYY-MM-DD — track a warranty end date you confirm\n"
+    "• PRICE ADJUST BY YYYY-MM-DD — track a price deadline you confirm\n"
+    "  Add FOR ITEM 2 to choose an item from LIST\n"
+    "• ACTIONS — list return, warranty, and price-adjustment cases\n"
+    "• CLOSE ACTION <number> / DISMISS ACTION <number> — update a case\n"
+    "• EDIT <field> <value> — correct extracted fields before confirming\n"
     f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
     "• DONE — acknowledge a follow-up\n"
     "• CONSUMED / RETURNED / REMOVED — update ownership\n"
@@ -136,7 +147,7 @@ def _selection_prompt(items: list[dict[str, Any]]) -> str:
     return (
         "I found these items on the receipt:\n"
         + "\n".join(lines)
-        + f"\nWhich should I check? Reply 1–{len(items)}."
+        + "\nReply ALL to review every item, or choose one / several with numbers like 1,3."
     )
 
 
@@ -159,7 +170,88 @@ def _product_confirmation(source_type: str, products: list[dict[str, Any]]) -> s
         extra = " Some details were hard to read — please confirm carefully."
     else:
         extra = ""
-    return f"I read this {source_type} item:\n" + "\n".join(fields) + extra + "\nReply YES if this is right, or NO to try again."
+    return (
+        f"I read this {source_type} item:\n"
+        + "\n".join(fields)
+        + extra
+        + "\nReply YES to save/update it, NO to try another photo, or EDIT PRODUCT <name>, "
+        "EDIT MODEL <model>, EDIT DATE <code>, EDIT BRAND <brand>, EDIT LOT <code>, or EDIT UPC <code>."
+    )
+
+
+EDIT_FIELDS = {
+    "brand": "brand",
+    "product": "product_name",
+    "name": "product_name",
+    "model": "model_number",
+    "date": "date_code",
+    "date code": "date_code",
+    "lot": "lot_number",
+    "upc": "upc",
+    "purchase date": "purchase_date",
+}
+
+
+def _parse_edit(text: str) -> tuple[int | None, str, str] | None:
+    match = re.fullmatch(
+        r"EDIT\s+(?:(\d{1,2})\s+)?(BRAND|PRODUCT|NAME|MODEL|DATE\s+CODE|DATE|LOT|UPC|PURCHASE\s+DATE)\s+(.+)",
+        text.strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    field = " ".join(match.group(2).casefold().split())
+    value = match.group(3).strip()
+    if not value:
+        return None
+    return (int(match.group(1)) if match.group(1) else None, EDIT_FIELDS[field], value)
+
+
+def _field_provenance(
+    item: dict[str, Any], source_type: str, edited_fields: list[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    edited = set(edited_fields or [])
+    confirmed_at = datetime.now(timezone.utc).isoformat()
+    provenance = {}
+    fields = (
+        "brand",
+        "product_name",
+        "size_or_capacity",
+        "purchase_date",
+        "upc",
+        "lot_number",
+        "expiration_date",
+        "model_number",
+        "date_code",
+    )
+    for field in fields:
+        if not item.get(field):
+            continue
+        was_edited = field in edited
+        provenance[field] = {
+            "source": "user" if was_edited else "gemini",
+            "source_type": source_type,
+            "user_confirmed": True,
+            "user_corrected": was_edited,
+            "confirmed_at": confirmed_at,
+        }
+    return provenance
+
+
+def _batch_confirmation(items: list[dict[str, Any]]) -> str:
+    lines = []
+    for index, item in enumerate(items, start=1):
+        brand = item.get("brand") or "Unknown brand"
+        name = item.get("product_name") or "Unknown product"
+        model = item.get("model_number") or "model not visible"
+        date_code = item.get("date_code") or item.get("lot_number") or "date/lot not visible"
+        lines.append(f"{index}. {brand} — {name} · {model} · {date_code}")
+    return (
+        "I read these receipt items:\n"
+        + "\n".join(lines)
+        + "\nReply YES to save all, or NO to discard them. To correct a row first, send "
+        "EDIT 2 PRODUCT <name>, EDIT 2 MODEL <model>, or another EDIT <number> <field> <value>."
+    )
 
 
 def _parse_identifiers(text: str) -> dict[str, str]:
@@ -198,6 +290,23 @@ def _format_list(products: list[dict[str, Any]]) -> str:
         monitoring = "monitoring on" if product.get("monitoring_enabled") else "monitoring off"
         lines.append(f"{index}. {brand} — {name} ({status}, {monitoring})")
     return "Saved products:\n" + "\n".join(lines)
+
+
+def _format_recovery_cases(cases: list[dict[str, Any]], products: list[dict[str, Any]]) -> str:
+    if not cases:
+        return (
+            "No recovery actions are being tracked. Add one with `RETURN BY YYYY-MM-DD`, "
+            "`WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`."
+        )
+    products_by_id = {product["id"]: product for product in products}
+    lines = []
+    for index, case in enumerate(cases, start=1):
+        product = products_by_id.get(case["product_id"], {})
+        name = product.get("product_name") or "Saved product"
+        case_type = str(case.get("case_type", "recovery")).replace("_", " ")
+        due = case.get("due_date") or "date not set"
+        lines.append(f"{index}. {case_type.title()} — {name} · {due} · {case.get('status', 'open')}")
+    return "Purchase recovery actions (dates you confirmed):\n" + "\n".join(lines)
 
 
 def _fixture_transparency(used_fixture: bool) -> str:
@@ -330,23 +439,47 @@ def _verify_mycharge(
     )
 
 
-def _save_receipt_item(owner: str, item: dict[str, Any]) -> dict[str, str]:
-    name = item.get("product_name")
-    if not name:
-        set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
-        return {"reply": "I couldn't save an item because its product name was unreadable. Please send a clearer receipt photo."}
+def _product_save_data(
+    item: dict[str, Any], source_type: str, edited_fields: list[str] | None = None
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     identifiers = {
         key: item.get(key)
         for key in ("size_or_capacity", "purchase_date", "upc", "lot_number", "expiration_date", "model_number", "date_code")
         if item.get(key)
     }
+    return identifiers, _field_provenance(item, source_type, edited_fields)
+
+
+def _save_receipt_item(
+    owner: str,
+    item: dict[str, Any],
+    *,
+    receipt_fingerprint: str | None = None,
+    receipt_item_index: int = 1,
+    edited_fields: list[str] | None = None,
+) -> dict[str, str]:
+    name = item.get("product_name")
+    if not name:
+        set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
+        return {"reply": "I couldn't save an item because its product name was unreadable. Please send a clearer receipt photo."}
+    identifiers, provenance = _product_save_data(item, "receipt", edited_fields)
     saved = save_confirmed_product(
         owner_handle=owner,
         brand=item.get("brand"),
         product_name=name,
         identifiers=identifiers,
         source_type="receipt",
+        field_provenance=provenance,
+        receipt_fingerprint=receipt_fingerprint,
+        receipt_item_index=receipt_item_index if receipt_fingerprint else None,
     )
+    if saved.get("_duplicate"):
+        set_conversation(
+            owner_handle=owner,
+            state="idle",
+            payload={"last_product_id": saved["id"]},
+        )
+        return {"reply": "That exact receipt item is already saved. I left the existing record unchanged."}
     product_payload = {
         "product_id": saved["id"],
         "brand": item.get("brand"),
@@ -387,11 +520,14 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             source_type = "label" if state == "awaiting_label" else "receipt"
             if state == "awaiting_product_confirmation":
                 return {"reply": "Please reply YES or NO to confirm the previous photo before sending another one."}
+            if state == "awaiting_batch_confirmation":
+                return {"reply": "Please reply YES or NO to finish reviewing the receipt before sending another photo."}
             if state == "awaiting_product_selection":
                 return {"reply": "Please reply with the item number first (for example, 1)."}
             if source_type == "label" and not payload.get("product_id"):
                 return {"reply": "Please send a receipt first so I know which household product this label belongs to."}
             raw = base64.b64decode(image["base64"], validate=True)
+            receipt_fingerprint = hashlib.sha256(raw).hexdigest() if source_type == "receipt" else None
             try:
                 extracted = await run_in_threadpool(extract_products, raw, image["mime_type"], source_type)
             except Exception as error:
@@ -408,7 +544,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 set_conversation(
                     owner_handle=owner,
                     state="awaiting_product_selection",
-                    payload={"source_type": "receipt", "items": ranked},
+                    payload={"source_type": "receipt", "items": ranked, "receipt_fingerprint": receipt_fingerprint},
                 )
                 return {"reply": _selection_prompt(ranked)}
 
@@ -422,6 +558,9 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     "brand": payload.get("brand"),
                     "product_name": payload.get("product_name"),
                     "identifiers": payload.get("identifiers") or {},
+                    "receipt_fingerprint": receipt_fingerprint,
+                    "receipt_item_index": 1 if source_type == "receipt" else None,
+                    "edited_fields": [],
                 },
             )
             return {"reply": _product_confirmation(source_type, items)}
@@ -439,7 +578,7 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             set_conversation(owner_handle=owner, state="idle", payload={})
             return {
                 "reply": (
-                    f"Deleted {deleted} saved product record(s), linked match evidence, "
+                    f"Deleted {deleted} saved product record(s), linked match evidence and recovery actions, "
                     "conversation state, and message deduplication records."
                 )
             }
@@ -447,22 +586,197 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         if lowered == "list":
             return {"reply": _format_list(list_owner_products(owner_handle=owner))}
 
+        if lowered in {"actions", "my actions", "cases"}:
+            return {
+                "reply": _format_recovery_cases(
+                    list_owner_recovery_cases(owner_handle=owner),
+                    list_owner_products(owner_handle=owner),
+                )
+            }
+
+        recovery_command = re.fullmatch(
+            r"(RETURN BY|WARRANTY UNTIL|PRICE ADJUST BY)\s+(\d{4}-\d{2}-\d{2})(?:\s+FOR ITEM\s+(\d{1,2}))?",
+            text,
+            re.IGNORECASE,
+        )
+        if recovery_command:
+            command = recovery_command.group(1).upper()
+            date_text = recovery_command.group(2)
+            item_number = int(recovery_command.group(3)) if recovery_command.group(3) else None
+            try:
+                confirmed_date = date.fromisoformat(date_text).isoformat()
+            except ValueError:
+                return {"reply": "Please use a valid calendar date in YYYY-MM-DD format."}
+
+            products = list_owner_products(owner_handle=owner)
+            if not products:
+                return {"reply": "Save a product first, then add a recovery action for it."}
+            selected_product = None
+            if item_number is not None:
+                if item_number < 1 or item_number > len(products):
+                    return {"reply": f"That item number is out of range. Text LIST to see items 1–{len(products)}."}
+                selected_product = products[item_number - 1]
+            else:
+                context_product_id = payload.get("product_id") or payload.get("last_product_id")
+                selected_product = next(
+                    (product for product in products if product["id"] == context_product_id),
+                    None,
+                )
+                if selected_product is None and len(products) == 1:
+                    selected_product = products[0]
+                if selected_product is None and len(products) > 1:
+                    return {
+                        "reply": (
+                            "Which saved product is this for? Text LIST, then use the item number, "
+                            f"for example `{command} {date_text} FOR ITEM 2`."
+                        )
+                    }
+            if selected_product is None:
+                return {"reply": "Save a product first, then add a recovery action for it."}
+
+            case_type = {
+                "RETURN BY": "return",
+                "WARRANTY UNTIL": "warranty",
+                "PRICE ADJUST BY": "price_adjustment",
+            }[command]
+            create_recovery_case(
+                owner_handle=owner,
+                product_id=selected_product["id"],
+                case_type=case_type,
+                due_date=confirmed_date,
+            )
+            date_meaning = {
+                "return": "return deadline",
+                "warranty": "warranty end date",
+                "price_adjustment": "price-adjustment deadline",
+            }[case_type]
+            return {
+                "reply": (
+                    f"Tracked {date_meaning} {confirmed_date} for "
+                    f"{selected_product.get('product_name') or 'your saved product'}. "
+                    "This date is user-confirmed, not checked against the retailer or warranty terms. "
+                    "Text ACTIONS to review tracked actions."
+                )
+            }
+
+        action_update = re.fullmatch(r"(CLOSE|DISMISS) ACTION\s+(\d{1,2})", text, re.IGNORECASE)
+        if action_update:
+            cases = list_owner_recovery_cases(owner_handle=owner)
+            action_number = int(action_update.group(2))
+            if action_number < 1 or action_number > len(cases):
+                return {"reply": f"That action number is out of range. Text ACTIONS to see your actions."}
+            selected_case = cases[action_number - 1]
+            if selected_case.get("status") != "open":
+                return {"reply": "That action is already closed. Text ACTIONS to review the list."}
+            new_status = "completed" if action_update.group(1).upper() == "CLOSE" else "not_applicable"
+            if not set_recovery_case_status(
+                owner_handle=owner,
+                case_id=selected_case["id"],
+                status=new_status,
+            ):
+                return {"reply": "I couldn't update that action. Text ACTIONS and try again."}
+            result_text = "marked complete" if new_status == "completed" else "marked not applicable"
+            return {"reply": f"Action {action_number} {result_text}. Text ACTIONS to review the list."}
+
         if state == "awaiting_product_selection":
             pending_items = payload.get("items") or []
-            if not re.fullmatch(r"\d{1,2}", text.strip()):
-                return {"reply": f"Reply with a number from 1 to {len(pending_items)} to choose which item to check."}
-            choice = int(text.strip())
-            if choice < 1 or choice > len(pending_items):
-                return {"reply": f"That number is out of range. Reply 1–{len(pending_items)}."}
-            selected = pending_items[choice - 1]
+            if text.strip().casefold() == "all":
+                choices = list(range(1, len(pending_items) + 1))
+            elif re.fullmatch(r"\d{1,2}(?:\s*,\s*\d{1,2})*", text.strip()):
+                choices = [int(value.strip()) for value in text.split(",")]
+                if len(set(choices)) != len(choices):
+                    return {"reply": "Please list each item number only once."}
+                if any(choice < 1 or choice > len(pending_items) for choice in choices):
+                    return {"reply": f"That number is out of range. Reply ALL or choose 1–{len(pending_items)}."}
+            else:
+                return {"reply": f"Reply ALL or choose one / several item numbers from 1 to {len(pending_items)}, like 1,3."}
+            selected = [pending_items[choice - 1] for choice in choices]
+            if len(selected) > 1:
+                set_conversation(
+                    owner_handle=owner,
+                    state="awaiting_batch_confirmation",
+                    payload={
+                        "source_type": "receipt",
+                        "items": selected,
+                        "receipt_item_indices": choices,
+                        "receipt_fingerprint": payload.get("receipt_fingerprint"),
+                        "edited_fields_by_item": [[] for _ in selected],
+                    },
+                )
+                return {"reply": _batch_confirmation(selected)}
             set_conversation(
                 owner_handle=owner,
                 state="awaiting_product_confirmation",
-                payload={"source_type": "receipt", "items": [selected]},
+                payload={
+                    "source_type": "receipt", "items": selected,
+                    "receipt_fingerprint": payload.get("receipt_fingerprint"),
+                    "receipt_item_index": choices[0], "edited_fields": [],
+                },
             )
-            return {"reply": _product_confirmation("receipt", [selected])}
+            return {"reply": _product_confirmation("receipt", selected)}
+
+        if state == "awaiting_batch_confirmation":
+            pending_items = payload.get("items") or []
+            edit = _parse_edit(text)
+            if edit:
+                item_number, field, value = edit
+                if item_number is None or item_number < 1 or item_number > len(pending_items):
+                    return {"reply": f"Include a valid row number from 1 to {len(pending_items)}, e.g. EDIT 2 PRODUCT Lamp."}
+                item = dict(pending_items[item_number - 1])
+                item[field] = value
+                item["uncertain_fields"] = [key for key in item.get("uncertain_fields", []) if key != field]
+                pending_items[item_number - 1] = item
+                edited = payload.get("edited_fields_by_item") or [[] for _ in pending_items]
+                edited[item_number - 1] = list(dict.fromkeys([*edited[item_number - 1], field]))
+                payload.update({"items": pending_items, "edited_fields_by_item": edited})
+                set_conversation(owner_handle=owner, state=state, payload=payload)
+                return {"reply": _batch_confirmation(pending_items)}
+            if _no(text):
+                set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
+                return {"reply": "Okay, I discarded those receipt details. Send another receipt photo when ready."}
+            if not _yes(text):
+                return {"reply": "Reply YES to save all listed items, NO to discard, or EDIT <row> <field> <value> first."}
+            saved_ids = []
+            duplicates = 0
+            unreadable = 0
+            edited = payload.get("edited_fields_by_item") or [[] for _ in pending_items]
+            for index, item in enumerate(pending_items):
+                if not item.get("product_name"):
+                    unreadable += 1
+                    continue
+                identifiers, provenance = _product_save_data(item, "receipt", edited[index])
+                row = save_confirmed_product(
+                    owner_handle=owner, brand=item.get("brand"), product_name=item["product_name"],
+                    identifiers=identifiers, source_type="receipt", field_provenance=provenance,
+                    receipt_fingerprint=payload.get("receipt_fingerprint"),
+                    receipt_item_index=(payload.get("receipt_item_indices") or [])[index],
+                )
+                saved_ids.append(row["id"])
+                duplicates += int(bool(row.get("_duplicate")))
+            set_conversation(
+                owner_handle=owner, state="idle",
+                payload={"last_product_id": saved_ids[0]} if saved_ids else {},
+            )
+            saved_count = len(saved_ids) - duplicates
+            return {"reply": (
+                f"Saved {saved_count} new item(s); {duplicates} exact receipt item(s) were already saved; "
+                f"{unreadable} item(s) had no readable product name and were skipped. The receipt image was not retained. "
+                "Text LIST, then CHECK 2 to check an item or MONITOR 2 to opt in to monitoring."
+            )}
 
         if state == "awaiting_product_confirmation":
+            edit = _parse_edit(text)
+            if edit:
+                item_number, field, value = edit
+                if item_number not in (None, 1):
+                    return {"reply": "This confirmation contains one item; use EDIT <field> <value>."}
+                pending_items = payload.get("items") or [{}]
+                item = dict(pending_items[0])
+                item[field] = value
+                item["uncertain_fields"] = [key for key in item.get("uncertain_fields", []) if key != field]
+                payload.update({"items": [item], "edited_fields": list(dict.fromkeys([*(payload.get("edited_fields") or []), field]))})
+                set_conversation(owner_handle=owner, state=state, payload=payload)
+                return {"reply": _product_confirmation(payload.get("source_type", "receipt"), [item])}
             if _no(text):
                 set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
                 return {"reply": "Okay. Send a clearer receipt or product-label photo and I'll read it again."}
@@ -478,7 +792,11 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     for key in ("model_number", "date_code", "lot_number", "upc", "expiration_date")
                     if item.get(key)
                 }
-                updated = update_product_identifiers(product_id=product_id, owner_handle=owner, updates=identifier_updates)
+                provenance = _field_provenance(item, "label", payload.get("edited_fields"))
+                updated = update_product_identifiers(
+                    product_id=product_id, owner_handle=owner, updates=identifier_updates,
+                    provenance={key: provenance[key] for key in identifier_updates if key in provenance},
+                )
                 return {
                     "reply": await _check_saved_product(
                         owner,
@@ -490,9 +808,14 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 }
 
             item = pending_items[0] if pending_items else {}
-            return _save_receipt_item(owner, item)
+            return _save_receipt_item(
+                owner, item, receipt_fingerprint=payload.get("receipt_fingerprint"),
+                receipt_item_index=payload.get("receipt_item_index") or 1,
+                edited_fields=payload.get("edited_fields"),
+            )
 
-        if state == "awaiting_monitor_optin":
+        indexed_product_command = re.fullmatch(r"(?:MONITOR|CHECK|RECHECK)\s+\d{1,2}", text, re.IGNORECASE)
+        if state == "awaiting_monitor_optin" and not indexed_product_command:
             if _no(text):
                 set_conversation(owner_handle=owner, state="idle", payload=payload)
                 return {"reply": "Okay, I saved the product without monitoring. You can opt in any time by texting MONITOR."}
@@ -511,6 +834,35 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     payload.get("identifiers") or {},
                 )
             }
+
+        monitor_number = re.fullmatch(r"MONITOR\s+(\d{1,2})", text, re.IGNORECASE)
+        if monitor_number:
+            products = list_owner_products(owner_handle=owner)
+            choice = int(monitor_number.group(1))
+            if choice < 1 or choice > len(products):
+                return {"reply": f"That item number is out of range. Text LIST to see items 1–{len(products)}."}
+            product = products[choice - 1]
+            enable_monitoring(product_id=product["id"], owner_handle=owner)
+            product_payload = {
+                "product_id": product["id"], "last_product_id": product["id"],
+                "product_name": product.get("product_name") or "", "brand": product.get("brand"),
+                "identifiers": product.get("identifiers") or {},
+            }
+            set_conversation(owner_handle=owner, state="idle", payload=product_payload)
+            return {"reply": "Monitoring is enabled for that item. " + await _check_saved_product(
+                owner, product["id"], product_payload["product_name"], product_payload["brand"], product_payload["identifiers"]
+            )}
+
+        check_number = re.fullmatch(r"(?:CHECK|RECHECK)\s+(\d{1,2})", text, re.IGNORECASE)
+        if check_number:
+            products = list_owner_products(owner_handle=owner)
+            choice = int(check_number.group(1))
+            if choice < 1 or choice > len(products):
+                return {"reply": f"That item number is out of range. Text LIST to see items 1–{len(products)}."}
+            product = products[choice - 1]
+            return {"reply": await _check_saved_product(
+                owner, product["id"], product.get("product_name") or "", product.get("brand"), product.get("identifiers") or {}
+            )}
 
         if lowered in {"check", "recheck"}:
             product_id = payload.get("product_id") or payload.get("last_product_id")
