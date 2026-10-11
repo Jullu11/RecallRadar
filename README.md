@@ -26,6 +26,15 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
 
 3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor. Migration `0005` creates the private receipt image bucket and metadata table.
 
+   Migration `0006` schedules hourly price-watch processing. Before the first run, store your deployed HTTPS API URL and the same random `BACKEND_INTERNAL_TOKEN` used by the backend in Supabase Vault:
+
+   ```sql
+   select vault.create_secret('https://YOUR-DEPLOYED-API', 'lodestone_api_url');
+   select vault.create_secret('YOUR_BACKEND_INTERNAL_TOKEN', 'lodestone_internal_token');
+   ```
+
+   This job checks due watches once every 24 hours, in batches of up to 25. The API deployment must be reachable from Supabase and have `KEEPA_API_KEY` configured. Results update the evidence desk; automated outbound price-drop iMessages are not enabled.
+
 4. Start the API and gateway in separate terminals from the repository root:
 
    ```sh
@@ -71,7 +80,7 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
 - `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. These are in-app/on-demand reminders; scheduled outbound messages are not configured.
 - `PACKET <action number> FOR <merchant>` drafts a copyable support message from the saved product details and the date the user entered. Missing order, payment, and issue details remain placeholders; the packet does not assert merchant policy or eligibility and is not submitted or saved as a separate record.
-- `WATCH PRICE <item> <Amazon URL> BELOW <$amount>` saves an Amazon.com price target. `PRICE CHECK <watch>` fetches the latest recorded Amazon price through Keepa; `PRICE WATCHES` lists saved checks and `STOP PRICE <watch>` pauses one. Add `KEEPA_API_KEY` for checks. Checks are manual unless a deployed scheduler calls the protected `POST /api/price-watches/run` endpoint. This version does not send price-drop iMessages.
+- `WATCH PRICE <item> <Amazon URL> BELOW <$amount>` saves an Amazon.com price target. `PRICE CHECK <watch>` fetches the latest recorded Amazon price through Keepa; `PRICE WATCHES` lists saved checks and `STOP PRICE <watch>` pauses one. Add `KEEPA_API_KEY` for checks. With migrations `0006` and the Vault secrets configured, Supabase Cron checks up to 25 due watches hourly; each watch is checked at most once per 24 hours. Results update the evidence desk; automated outbound price-drop iMessages are not enabled.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 

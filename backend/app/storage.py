@@ -345,6 +345,7 @@ def create_price_watch(
                 "provider": "keepa", "asin": asin, "product_url": product_url,
                 "target_price": round(target_price, 2), "current_price": None, "provider_title": None,
                 "last_checked_at": None, "check_error": None, "is_active": True,
+                "next_check_at": _now(),
                 "created_at": _now(), "updated_at": _now(),
             }
             _MEMORY.price_watches[row["id"]] = row
@@ -372,7 +373,7 @@ def list_owner_price_watches(*, owner_handle: str) -> list[dict[str, Any]]:
         return rows
     result = (
         get_supabase().table("price_watches")
-        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,next_check_at,check_error,is_active,created_at")
         .eq("owner_handle", owner_handle).order("created_at").execute()
     )
     return result.data or []
@@ -381,13 +382,19 @@ def list_owner_price_watches(*, owner_handle: str) -> list[dict[str, Any]]:
 def list_active_price_watches(*, limit: int = 25) -> list[dict[str, Any]]:
     if uses_memory_store():
         with _MEMORY.lock:
-            rows = [copy.deepcopy(row) for row in _MEMORY.price_watches.values() if row.get("is_active")]
-        rows.sort(key=lambda row: row.get("last_checked_at") or row.get("created_at") or "")
+            now = _now()
+            rows = [
+                copy.deepcopy(row) for row in _MEMORY.price_watches.values()
+                if row.get("is_active") and row.get("next_check_at", row.get("created_at", "")) <= now
+            ]
+        rows.sort(key=lambda row: row.get("next_check_at") or row.get("created_at") or "")
         return rows[:limit]
+    now = _now()
     result = (
         get_supabase().table("price_watches")
-        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
-        .eq("is_active", True).order("last_checked_at", desc=False).limit(limit).execute()
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,next_check_at,check_error,is_active,created_at")
+        .eq("is_active", True).lte("next_check_at", now)
+        .order("next_check_at").limit(limit).execute()
     )
     return result.data or []
 
@@ -397,7 +404,13 @@ def record_price_check(
     provider_title: str | None = None, error: str | None = None,
 ) -> dict[str, Any] | None:
     now = _now()
-    values = {"check_error": error[:250] if error else None, "updated_at": now}
+    from datetime import timedelta
+
+    values = {
+        "check_error": error[:250] if error else None,
+        "next_check_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+        "updated_at": now,
+    }
     if current_price is not None:
         values.update({
             "current_price": round(current_price, 2),
@@ -894,7 +907,7 @@ def get_dashboard_snapshot() -> dict[str, Any]:
     ) or []
     price_watches = (
         client.table("price_watches")
-        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,check_error,is_active,created_at")
+        .select("id,owner_handle,product_id,provider,asin,product_url,target_price,current_price,provider_title,last_checked_at,next_check_at,check_error,is_active,created_at")
         .in_("product_id", product_ids)
         .order("created_at")
         .limit(200)
