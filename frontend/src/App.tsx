@@ -16,38 +16,120 @@ function productTitle(product: Product): string {
 }
 
 export default function App() {
+  const authUrl = import.meta.env.VITE_SUPABASE_URL;
+  const authAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  const authConfigured = Boolean(authUrl && authAnonKey);
   const [view, setView] = useState<View>("home");
   const [data, setData] = useState<DashboardPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem("lodestone_access_token"));
+  const [email, setEmail] = useState("");
+  const [otp, setOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [linkedSender, setLinkedSender] = useState<string | null | undefined>(undefined);
+  const [linkCode, setLinkCode] = useState<string | null>(null);
+
+  const sendOtp = async () => {
+    setAuthError(null);
+    try {
+      const response = await fetch(`${authUrl}/auth/v1/otp`, {
+        method: "POST",
+        headers: { apikey: authAnonKey!, "content-type": "application/json" },
+        body: JSON.stringify({ email, create_user: true }),
+      });
+      if (!response.ok) throw new Error("Could not send a sign-in code. Check the email and Supabase Auth settings.");
+      setOtpSent(true);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Sign-in request failed.");
+    }
+  };
+
+  const verifyOtp = async () => {
+    setAuthError(null);
+    try {
+      const response = await fetch(`${authUrl}/auth/v1/verify`, {
+        method: "POST",
+        headers: { apikey: authAnonKey!, "content-type": "application/json" },
+        body: JSON.stringify({ email, token: otp, type: "email" }),
+      });
+      if (!response.ok) throw new Error("That code did not verify. Check it and try again.");
+      const session = (await response.json()) as { access_token?: string };
+      if (!session.access_token) throw new Error("Supabase Auth returned no access token.");
+      window.localStorage.setItem("lodestone_access_token", session.access_token);
+      setAccessToken(session.access_token);
+      setLinkedSender(undefined);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Code verification failed.");
+    }
+  };
+
+  const requestLinkCode = async () => {
+    setAuthError(null);
+    try {
+      const response = await fetch("/api/account/link-code", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const payload = (await response.json()) as { code?: string; detail?: string };
+      if (!response.ok || !payload.code) throw new Error(payload.detail || "Could not create a phone link code.");
+      setLinkCode(payload.code);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Could not create a phone link code.");
+    }
+  };
 
   useEffect(() => {
     if (view !== "desk") return;
+    if (authConfigured && !accessToken) return;
     let cancelled = false;
     const load = async () => {
       setLoading(true);
       setError(null);
       try {
-        const response = await fetch("/api/dashboard");
-        if (!response.ok) throw new Error(`Dashboard request failed (${response.status})`);
+        const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined;
+        if (authConfigured) {
+          const accountResponse = await fetch("/api/account", { headers });
+          if (!accountResponse.ok) throw new Error("Your sign-in expired. Sign in again to continue.");
+          const accountPayload = (await accountResponse.json()) as { linked: boolean; sender_id: string | null };
+          if (cancelled) return;
+          setLinkedSender(accountPayload.sender_id);
+          if (!accountPayload.linked) {
+            setData(null);
+            return;
+          }
+        }
+        const response = await fetch("/api/dashboard", { headers });
+      if (!response.ok) {
+        if (response.status === 401) throw new Error("Your sign-in expired. Sign in again to continue.");
+        throw new Error(`Dashboard request failed (${response.status})`);
+      }
         const payload = (await response.json()) as DashboardPayload;
         if (cancelled) return;
         setData(payload);
         setSelectedProductId((current) => current ?? payload.products[0]?.id ?? null);
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load dashboard");
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Failed to load dashboard";
+          setError(message);
+          if (message.includes("sign-in expired")) {
+            window.localStorage.removeItem("lodestone_access_token");
+            setAccessToken(null);
+          }
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
     };
     void load();
-    const timer = window.setInterval(() => void load(), 8000);
+    const timer = window.setInterval(() => void load(), 15000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [view]);
+  }, [view, authConfigured, accessToken]);
 
   const selectedProduct = useMemo(
     () => data?.products.find((item) => item.id === selectedProductId) ?? null,
@@ -118,6 +200,49 @@ export default function App() {
     );
   }
 
+  if (authConfigured && !accessToken) {
+    return (
+      <div className="page">
+        <main className="auth-card">
+          <p className="eyebrow">Lodestone account</p>
+          <h2>{otpSent ? "Check your email" : "Sign in to your evidence desk"}</h2>
+          {otpSent ? (
+            <>
+              <p>Enter the one-time code sent to {email}.</p>
+              <input className="auth-input" inputMode="numeric" autoComplete="one-time-code" value={otp} onChange={(event) => setOtp(event.target.value)} placeholder="Email code" />
+              <button className="btn btn-primary" type="button" onClick={() => void verifyOtp()}>Verify code</button>
+            </>
+          ) : (
+            <>
+              <p>Use a one-time email code to view records linked to your phone.</p>
+              <input className="auth-input" type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" />
+              <button className="btn btn-primary" type="button" onClick={() => void sendOtp()}>Email me a code</button>
+            </>
+          )}
+          {authError ? <p className="error">{authError}</p> : null}
+          <button className="btn btn-ghost" type="button" onClick={() => setView("home")}>Back to home</button>
+        </main>
+      </div>
+    );
+  }
+
+  if (authConfigured && accessToken && linkedSender === null) {
+    return (
+      <div className="page">
+        <main className="auth-card">
+          <p className="eyebrow">Connect your phone</p>
+          <h2>Link your iMessage account</h2>
+          <p>Generate a short-lived code, then text the exact <strong>LINK &lt;code&gt;</strong> shown below from the same phone number that sends your receipts.</p>
+          {linkCode ? <p className="link-code">LINK {linkCode}</p> : null}
+          <button className="btn btn-primary" type="button" onClick={() => void requestLinkCode()}>Generate link code</button>
+          {authError ? <p className="error">{authError}</p> : null}
+          <p className="reminder-note">The code expires in 10 minutes. This page will open your records after the phone is linked.</p>
+          <button className="btn btn-ghost" type="button" onClick={() => { window.localStorage.removeItem("lodestone_access_token"); setAccessToken(null); }}>Sign out</button>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="page">
       <main className="desk">
@@ -132,6 +257,15 @@ export default function App() {
             <button className="btn btn-ghost" type="button" style={{ color: "var(--ink)", marginTop: "0.5rem" }} onClick={() => setView("home")}>
               Back to home
             </button>
+            {authConfigured ? (
+              <button className="btn btn-ghost" type="button" style={{ color: "var(--ink)", marginTop: "0.5rem" }} onClick={() => {
+                window.localStorage.removeItem("lodestone_access_token");
+                setAccessToken(null);
+                setData(null);
+              }}>
+                Sign out
+              </button>
+            ) : null}
           </div>
         </header>
 

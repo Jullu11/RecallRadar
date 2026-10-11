@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     keepa_api_key: str | None = None
     supabase_url: str | None = None
+    supabase_anon_key: str | None = None
     supabase_service_role_key: str | None = None
     spectrum_project_id: str | None = None
     spectrum_project_secret: str | None = None

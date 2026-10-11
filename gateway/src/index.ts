@@ -25,10 +25,7 @@ const allowedSenderIds = new Set(
     .map((senderId) => senderId.trim())
     .filter(Boolean),
 );
-
-if (allowedSenderIds.size === 0) {
-  throw new Error("ALLOWED_SENDER_IDS must contain at least one exact Spectrum sender ID.");
-}
+const linkedSenderIds = new Set<string>();
 
 type ContentPart = {
   type?: string;
@@ -67,9 +64,25 @@ async function handleInbound(space: any, message: any): Promise<void> {
   if (space.type === "group") return;
 
   const senderId = String(message.sender?.id ?? space.id);
-  if (!allowedSenderIds.has(senderId)) {
-    console.warn(`Blocked sender: ${senderId} (not in ALLOWED_SENDER_IDS)`);
-    return;
+  const { texts, attachments } = flattenContent(message.content as ContentPart);
+  const caption = texts.map((part) => part.trim()).filter(Boolean).join("\n");
+  if (!allowedSenderIds.has(senderId) && !linkedSenderIds.has(senderId) && !/^LINK\s+\d{10}$/i.test(caption)) {
+    try {
+      const status = await fetch(`${backendUrl}/api/senders/linked`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN! },
+        body: JSON.stringify({ sender_id: senderId }),
+      });
+      const linked = status.ok && (await status.json() as { linked?: boolean }).linked;
+      if (!linked) {
+        console.warn(`Blocked sender: ${senderId} (not linked)`);
+        return;
+      }
+      linkedSenderIds.add(senderId);
+    } catch (error) {
+      console.error("Could not verify sender link", error);
+      return;
+    }
   }
 
   const incoming: Record<string, unknown> = {
@@ -77,9 +90,6 @@ async function handleInbound(space: any, message: any): Promise<void> {
     sender_id: senderId,
     space_id: space.id,
   };
-
-  const { texts, attachments } = flattenContent(message.content as ContentPart);
-  const caption = texts.map((part) => part.trim()).filter(Boolean).join("\n");
 
   if (attachments.length > 0) {
     const attachment = attachments[0];
@@ -130,6 +140,9 @@ async function handleInbound(space: any, message: any): Promise<void> {
     return;
   }
   const result = (await response.json()) as { reply?: string };
+  if (response.ok && /^LINK\s+\d{10}$/i.test(caption) && result.reply?.startsWith("Your Lodestone account is linked")) {
+    linkedSenderIds.add(senderId);
+  }
   if (result.reply) await space.send(result.reply);
 }
 
@@ -160,7 +173,6 @@ async function dispatchPendingNotifications(): Promise<void> {
       notifications?: Array<{ id: string; owner_handle: string; message: string }>;
     };
     for (const notification of payload.notifications ?? []) {
-      if (!allowedSenderIds.has(notification.owner_handle)) continue;
       try {
         const space = await spectrum.space(notification.owner_handle);
         await space.send(notification.message);

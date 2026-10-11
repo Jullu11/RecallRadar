@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import secrets
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -36,6 +38,8 @@ class _MemoryStore:
         self.price_watches: dict[str, dict[str, Any]] = {}
         self.receipt_images: dict[tuple[str, str], dict[str, Any]] = {}
         self.notification_outbox: dict[str, dict[str, Any]] = {}
+        self.account_links: dict[str, str] = {}
+        self.account_link_codes: dict[str, dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
 
@@ -119,7 +123,7 @@ def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: byte
     suffix = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime_type)
     if not suffix:
         raise ValueError("Unsupported receipt image type.")
-    owner_key = __import__("hashlib").sha256(owner_handle.encode("utf-8")).hexdigest()
+    owner_key = hashlib.sha256(owner_handle.encode("utf-8")).hexdigest()
     path = f"{owner_key}/{fingerprint}.{suffix}"
     if uses_memory_store():
         with _MEMORY.lock:
@@ -171,6 +175,75 @@ def create_receipt_image_link(*, owner_handle: str, product_id: str, expires_in:
     if str(signed_url).startswith("/storage/"):
         return f"{base_url}{signed_url}"
     return f"{base_url}/storage/v1{signed_url}"
+
+
+def create_account_link_code(*, user_id: str, ttl_minutes: int = 10) -> str:
+    code = f"{secrets.randbelow(10_000_000_000):010d}"
+    code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
+    if uses_memory_store():
+        with _MEMORY.lock:
+            for key, row in list(_MEMORY.account_link_codes.items()):
+                if row["user_id"] == user_id:
+                    del _MEMORY.account_link_codes[key]
+            _MEMORY.account_link_codes[code_hash] = {"user_id": user_id, "expires_at": expires}
+        return code
+    client = get_supabase()
+    client.table("account_link_codes").delete().eq("user_id", user_id).execute()
+    client.table("account_link_codes").insert({"code_hash": code_hash, "user_id": user_id, "expires_at": expires}).execute()
+    return code
+
+
+def redeem_account_link_code(*, owner_handle: str, code: str) -> bool:
+    code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
+    now = _now()
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.account_link_codes.get(code_hash)
+            if not row or row["expires_at"] <= now:
+                return False
+            _MEMORY.account_links[row["user_id"]] = owner_handle
+            del _MEMORY.account_link_codes[code_hash]
+            return True
+    client = get_supabase()
+    rows = (
+        client.table("account_link_codes").update({"consumed_at": now})
+        .eq("code_hash", code_hash).is_("consumed_at", "null").gt("expires_at", now)
+        .select("user_id").execute().data
+    )
+    if not rows:
+        return False
+    try:
+        client.table("account_links").upsert(
+            {"user_id": rows[0]["user_id"], "owner_handle": owner_handle}, on_conflict="user_id",
+        ).execute()
+    except Exception:
+        return False
+    return True
+
+
+def account_owner_handle(*, user_id: str) -> str | None:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            return _MEMORY.account_links.get(user_id)
+    result = get_supabase().table("account_links").select("owner_handle").eq("user_id", user_id).limit(1).execute()
+    return result.data[0]["owner_handle"] if result.data else None
+
+
+def is_linked_sender(*, owner_handle: str) -> bool:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            return owner_handle in _MEMORY.account_links.values()
+    result = get_supabase().table("account_links").select("user_id").eq("owner_handle", owner_handle).limit(1).execute()
+    return bool(result.data)
+
+
+def list_linked_sender_handles() -> list[str]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            return list(set(_MEMORY.account_links.values()))
+    result = get_supabase().table("account_links").select("owner_handle").limit(1000).execute()
+    return [row["owner_handle"] for row in result.data or []]
 
     try:
         result = client.table("products").insert(
@@ -895,36 +968,42 @@ def reset_memory_store() -> None:
         _MEMORY.price_watches.clear()
         _MEMORY.receipt_images.clear()
         _MEMORY.notification_outbox.clear()
+        _MEMORY.account_links.clear()
+        _MEMORY.account_link_codes.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
 
 
-def get_dashboard_snapshot() -> dict[str, Any]:
+def get_dashboard_snapshot(*, owner_handle: str | None = None) -> dict[str, Any]:
     """Team/demo dashboard payload: products, matches, notices, and follow-ups."""
     if uses_memory_store():
         with _MEMORY.lock:
             products = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.products.values()),
+                (
+                    copy.deepcopy(row) for row in _MEMORY.products.values()
+                    if owner_handle is None or row["owner_handle"] == owner_handle
+                ),
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
             notices = [copy.deepcopy(row) for row in _MEMORY.notices.values()]
+            product_ids = {row["id"] for row in products}
             matches = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.matches.values()),
+                (copy.deepcopy(row) for row in _MEMORY.matches.values() if row["product_id"] in product_ids),
                 key=lambda item: item.get("checked_at") or "",
                 reverse=True,
             )
             follow_ups = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.follow_ups),
+                (copy.deepcopy(row) for row in _MEMORY.follow_ups if row["product_id"] in product_ids),
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
             recovery_cases = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.recovery_cases.values()),
+                (copy.deepcopy(row) for row in _MEMORY.recovery_cases.values() if row["product_id"] in product_ids),
                 key=lambda item: (item.get("due_date") or "9999-12-31", item.get("created_at") or ""),
             )
             price_watches = sorted(
-                (copy.deepcopy(row) for row in _MEMORY.price_watches.values()),
+                (copy.deepcopy(row) for row in _MEMORY.price_watches.values() if row["product_id"] in product_ids),
                 key=lambda item: item.get("created_at") or "",
             )
         return {
@@ -938,15 +1017,13 @@ def get_dashboard_snapshot() -> dict[str, Any]:
         }
 
     client = get_supabase()
-    products = (
+    products_query = (
         client.table("products")
         .select("id,owner_handle,brand,product_name,identifiers,field_provenance,status,monitoring_enabled,source_type,created_at,updated_at")
-        .order("created_at", desc=True)
-        .limit(100)
-        .execute()
-        .data
-        or []
     )
+    if owner_handle is not None:
+        products_query = products_query.eq("owner_handle", owner_handle)
+    products = products_query.order("created_at", desc=True).limit(100).execute().data or []
     notices = (
         client.table("notices")
         .select("id,agency,external_id,title,official_url,affected_criteria,retrieved_at,historical_fixture")
@@ -956,25 +1033,25 @@ def get_dashboard_snapshot() -> dict[str, Any]:
         .data
         or []
     )
+    product_ids = [product["id"] for product in products]
     matches = (
         client.table("matches")
         .select("id,product_id,notice_id,decision,evidence,checked_at")
+        .in_("product_id", product_ids)
         .order("checked_at", desc=True)
         .limit(100)
         .execute()
-        .data
-        or []
-    )
+        .data if product_ids else []
+    ) or []
     follow_ups = (
         client.table("follow_ups")
         .select("id,product_id,notice_id,action,due_at,acknowledged_at,completed_at,created_at")
+        .in_("product_id", product_ids)
         .order("created_at", desc=True)
         .limit(100)
         .execute()
-        .data
-        or []
-    )
-    product_ids = [product["id"] for product in products]
+        .data if product_ids else []
+    ) or []
     recovery_cases = (
         client.table("recovery_cases")
         .select("id,product_id,case_type,due_date,status,date_source,created_at,completed_at")

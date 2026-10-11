@@ -20,11 +20,12 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
 
    - `GEMINI_API_KEY`: Google AI Studio API key.
    - `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`: your Supabase project values. Keep the service-role key on the backend; do not put it in client code.
+   - `SUPABASE_ANON_KEY`, `VITE_SUPABASE_URL`, and `VITE_SUPABASE_ANON_KEY`: use your project's public anon/publishable key in the two anon settings. Enable email OTP in Supabase Auth. The browser key is public by design; never use the service-role key here.
    - `SPECTRUM_PROJECT_ID` and `SPECTRUM_PROJECT_SECRET`: Spectrum Cloud project credentials.
    - `BACKEND_INTERNAL_TOKEN`: a private random string shared only by the local gateway and API.
-   - `ALLOWED_SENDER_IDS`: your exact sender ID as Spectrum delivers it. Leave no blank allowlist in a working gateway; empty denies all senders. Separate multiple exact IDs with commas.
+   - `ALLOWED_SENDER_IDS`: optional comma-separated sender IDs for trusted existing users. New users can pair by sending a one-time `LINK <code>` message; other unknown senders are rejected before message content is forwarded.
 
-3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor. Migration `0005` creates the private receipt image bucket and metadata table.
+3. Apply the SQL migrations in `supabase/migrations/` to your Supabase project in numeric order using its SQL editor. Migration `0005` creates private receipt image storage, `0007` the notification outbox, and `0008` the account-link tables.
 
    Migration `0006` schedules hourly price-watch processing. Before the first run, store your deployed HTTPS API URL and the same random `BACKEND_INTERNAL_TOKEN` used by the backend in Supabase Vault:
 
@@ -53,7 +54,7 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
 
    Then open [http://127.0.0.1:5173](http://127.0.0.1:5173). For a production build served by FastAPI on port 8000, run `make web-build` and open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
-5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). The live inventory/evidence payload is at [http://127.0.0.1:8000/api/dashboard](http://127.0.0.1:8000/api/dashboard).
+5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). With VITE auth settings configured, sign in to the evidence desk, request a pairing code, and send `LINK <10-digit code>` to Lodestone from your phone. Dashboard records are filtered to that linked sender. Without browser auth settings, the local demo desk continues to show the in-memory demo snapshot.
 
 The gateway connects outbound to Spectrum Cloud and listens to its message stream. It calls the local FastAPI service at `http://127.0.0.1:8000`; this setup does not need a public webhook or HTTPS tunnel. Keep the FastAPI port private.
 
@@ -75,7 +76,7 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
 - The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. Receipt originals are retained in a private Supabase Storage bucket when persistence is configured; demo mode keeps them only in memory until the process exits. Receipt images are deduplicated per sender. Label images are still used for extraction only.
 - Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
-- Supabase stores confirmed product details, opt-in state, match evidence, follow-up status, and price-watch records.
+- Supabase stores confirmed product details, retained private receipt images, opt-in state, match evidence, follow-up status, price watches, and email-authenticated account-to-sender links. The production dashboard requires sign-in and only returns the linked sender's records.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms or submit claims.
 - `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. The gateway checks for upcoming/overdue dates and sends one iMessage reminder per date when it is running; messages may be delayed while the gateway is offline.

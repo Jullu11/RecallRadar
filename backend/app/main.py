@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+import httpx
 
 from .cpsc import search_recalls
 from .extraction import extract_products
@@ -24,6 +26,11 @@ from .storage import (
     list_owner_products,
     list_owner_price_watches,
     list_owner_recovery_cases,
+    list_linked_sender_handles,
+    account_owner_handle,
+    create_account_link_code,
+    is_linked_sender,
+    redeem_account_link_code,
     record_price_check,
     uses_memory_store,
 )
@@ -65,9 +72,53 @@ def demo_notice() -> dict:
     return NOTICE
 
 
+def _authenticated_user_id(authorization: str | None) -> str:
+    settings = get_settings()
+    if not settings.supabase_url or not settings.supabase_service_role_key:
+        raise HTTPException(status_code=503, detail="Supabase Auth is not configured.")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sign in to view your evidence desk.")
+    try:
+        response = httpx.get(
+            f"{settings.supabase_url.rstrip('/')}/auth/v1/user",
+            headers={"apikey": settings.supabase_service_role_key, "Authorization": authorization},
+            timeout=8,
+        )
+        response.raise_for_status()
+        user_id = response.json().get("id")
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="Your sign-in has expired. Please sign in again.") from error
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid sign-in session.")
+    return str(user_id)
+
+
+@app.get("/api/account")
+def account(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    user_id = _authenticated_user_id(authorization)
+    sender = account_owner_handle(user_id=user_id)
+    return {"linked": sender is not None, "sender_id": sender}
+
+
+@app.post("/api/account/link-code")
+def account_link_code(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    user_id = _authenticated_user_id(authorization)
+    if account_owner_handle(user_id=user_id):
+        raise HTTPException(status_code=409, detail="This account already has a linked phone.")
+    return {"code": create_account_link_code(user_id=user_id), "expires_in_minutes": 10}
+
+
 @app.get("/api/dashboard")
-def dashboard() -> dict:
-    snapshot = get_dashboard_snapshot()
+def dashboard(authorization: str | None = Header(default=None)) -> dict:
+    settings = get_settings()
+    if settings.demo_mode or uses_memory_store():
+        snapshot = get_dashboard_snapshot()
+    else:
+        user_id = _authenticated_user_id(authorization)
+        sender = account_owner_handle(user_id=user_id)
+        if not sender:
+            raise HTTPException(status_code=403, detail="Link your iMessage sender to view your records.")
+        snapshot = get_dashboard_snapshot(owner_handle=sender)
     return {
         **snapshot,
         "demo_notice": NOTICE,
@@ -125,7 +176,8 @@ def pending_notifications(x_lodestone_internal: str | None = Header(default=None
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
     today = datetime.now(timezone.utc).date()
-    for owner in get_settings().allowed_sender_id_set:
+    owners = get_settings().allowed_sender_id_set | set(list_linked_sender_handles())
+    for owner in owners:
         products = list_owner_products(owner_handle=owner)
         product_names = {row["id"]: row.get("product_name") or "your product" for row in products}
         for case in list_owner_recovery_cases(owner_handle=owner):
@@ -183,6 +235,20 @@ def notification_sent(
     if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
         raise HTTPException(status_code=401, detail="Unauthorized.")
     return {"acknowledged": acknowledge_notification(notification_id=notification_id)}
+
+
+@app.post("/api/senders/linked")
+def sender_is_linked(
+    event: dict[str, str],
+    x_lodestone_internal: str | None = Header(default=None),
+) -> dict[str, bool]:
+    expected = get_settings().backend_internal_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="The internal gateway token is not configured.")
+    if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+    sender_id = event.get("sender_id", "")
+    return {"linked": bool(sender_id and is_linked_sender(owner_handle=sender_id))}
 
 
 @app.post("/api/extract")
@@ -291,8 +357,14 @@ async def photon_message(
     except Exception as error:
         raise HTTPException(status_code=422, detail="Invalid Photon message payload.") from error
 
+    link_match = re.fullmatch(r"LINK\s+(\d{10})", parsed.text or "", re.IGNORECASE)
+    if link_match and not parsed.image:
+        if redeem_account_link_code(owner_handle=parsed.sender_id, code=link_match.group(1)):
+            return {"reply": "Your Lodestone account is linked. Your saved products and receipts will appear in your evidence desk."}
+        return {"reply": "That link code is invalid or expired. Sign in to Lodestone and request a new code."}
+
     allowed = get_settings().allowed_sender_id_set
-    if parsed.sender_id not in allowed and not (get_settings().demo_mode or uses_memory_store()):
+    if parsed.sender_id not in allowed and not is_linked_sender(owner_handle=parsed.sender_id) and not (get_settings().demo_mode or uses_memory_store()):
         raise HTTPException(status_code=403, detail="This sender is not allowed to use Lodestone.")
     if parsed.content_type == "attachment" and parsed.image is None:
         raise HTTPException(status_code=400, detail="Attachment data is missing.")
