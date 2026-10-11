@@ -4,7 +4,7 @@ import base64
 import hashlib
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -53,7 +53,7 @@ IDENTIFIER_HINT = "MODEL <model on label> DATE <code on label>"
 
 HELP_TEXT = (
     "Lodestone: Every purchase, on record. Save receipts for the moments they matter.\n"
-    "Recall checks are the first feature; warranty, return, and price-refund tools are planned.\n"
+    "I can check recalls and track return, warranty, and price-adjustment dates you provide.\n"
     "Commands:\n"
     "• Send a receipt photo to add a product\n"
     "• YES / NO — confirm extracted details\n"
@@ -66,6 +66,7 @@ HELP_TEXT = (
     "• PRICE ADJUST BY YYYY-MM-DD — track a price deadline you confirm\n"
     "  Add FOR ITEM 2 to choose an item from LIST\n"
     "• ACTIONS — list return, warranty, and price-adjustment cases\n"
+    "• REMINDERS — show overdue actions and dates due in the next 30 days\n"
     "• CLOSE ACTION <number> / DISMISS ACTION <number> — update a case\n"
     "• EDIT <field> <value> — correct extracted fields before confirming\n"
     f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
@@ -307,6 +308,38 @@ def _format_recovery_cases(cases: list[dict[str, Any]], products: list[dict[str,
         due = case.get("due_date") or "date not set"
         lines.append(f"{index}. {case_type.title()} — {name} · {due} · {case.get('status', 'open')}")
     return "Purchase recovery actions (dates you confirmed):\n" + "\n".join(lines)
+
+
+def _format_reminders(cases: list[dict[str, Any]], products: list[dict[str, Any]]) -> str:
+    today = datetime.now(timezone.utc).date()
+    horizon = today + timedelta(days=30)
+    products_by_id = {product["id"]: product for product in products}
+    relevant = []
+    for index, case in enumerate(cases, start=1):
+        if case.get("status") != "open":
+            continue
+        try:
+            due = date.fromisoformat(str(case.get("due_date")))
+        except (TypeError, ValueError):
+            continue
+        if due <= horizon:
+            relevant.append((index, due, case))
+    if not relevant:
+        return "No open purchase actions are due in the next 30 days. Text ACTIONS to see all tracked dates."
+    lines = []
+    for index, due, case in relevant:
+        product = products_by_id.get(case.get("product_id"), {})
+        name = product.get("product_name") or "Saved product"
+        label = "Overdue" if due < today else "Due today" if due == today else "Due"
+        lines.append(
+            f"Action {index}: {label} {due.isoformat()} — "
+            f"{str(case.get('case_type', 'recovery')).replace('_', ' ').title()} · {name}"
+        )
+    return (
+        "Purchase reminders (dates you confirmed; no retailer terms were verified):\n"
+        + "\n".join(lines)
+        + "\nUse CLOSE ACTION <number> or DISMISS ACTION <number> when an action no longer needs tracking."
+    )
 
 
 def _fixture_transparency(used_fixture: bool) -> str:
@@ -589,6 +622,14 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         if lowered in {"actions", "my actions", "cases"}:
             return {
                 "reply": _format_recovery_cases(
+                    list_owner_recovery_cases(owner_handle=owner),
+                    list_owner_products(owner_handle=owner),
+                )
+            }
+
+        if lowered in {"reminders", "upcoming", "what's due", "whats due"}:
+            return {
+                "reply": _format_reminders(
                     list_owner_recovery_cases(owner_handle=owner),
                     list_owner_products(owner_handle=owner),
                 )
