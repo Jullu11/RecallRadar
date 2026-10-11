@@ -69,6 +69,22 @@ export default function App() {
     return data.recovery_cases.filter((item) => item.product_id === selectedProductId);
   }, [data, selectedProductId]);
 
+  const openRecoveryCases = useMemo(() => {
+    if (!data) return [] as RecoveryCase[];
+    return data.recovery_cases.filter((item) => item.status === "open");
+  }, [data]);
+
+  const deadlineLabel = (dueDate: string) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const due = new Date(`${dueDate}T00:00:00`);
+    const days = Math.round((due.getTime() - today.getTime()) / 86_400_000);
+    if (days < 0) return `Overdue by ${Math.abs(days)} day${days === -1 ? "" : "s"}`;
+    if (days === 0) return "Due today";
+    if (days === 1) return "Due tomorrow";
+    return `Due in ${days} days`;
+  };
+
   if (view === "home") {
     return (
       <div className="page">
@@ -143,6 +159,36 @@ export default function App() {
 
         {error ? <p className="error">{error}</p> : null}
         {loading && !data ? <p className="empty">Loading inventory from the live agent…</p> : null}
+
+        <section className="reminder-panel" aria-label="Open purchase reminders">
+          <div className="reminder-heading">
+            <div>
+              <p className="eyebrow">Purchase recovery</p>
+              <h3 className="panel-title">Open deadline reminders</h3>
+            </div>
+            <span>{openRecoveryCases.length} open</span>
+          </div>
+          {!openRecoveryCases.length ? (
+            <p className="empty">No open dates tracked. Text RETURN BY, WARRANTY UNTIL, or PRICE ADJUST BY with a date, then use REMINDERS to review what is due.</p>
+          ) : (
+            <ul className="reminder-list">
+              {openRecoveryCases.map((item) => {
+                const product = data?.products.find((candidate) => candidate.id === item.product_id);
+                return (
+                  <li key={item.id}>
+                    <button type="button" onClick={() => setSelectedProductId(item.product_id)}>
+                      <strong>{product ? productTitle(product) : "Saved product"}</strong>
+                      <span>
+                        {item.case_type.replace("_", " ")} · {deadlineLabel(item.due_date)} · {item.due_date}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          <p className="reminder-note">Dates come from you. Lodestone does not verify retailer terms or send proactive messages yet.</p>
+        </section>
 
         <div className="desk-grid">
           <section>

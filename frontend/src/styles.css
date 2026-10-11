@@ -261,6 +261,67 @@ button {
   letter-spacing: -0.01em;
 }
 
+.reminder-panel {
+  margin: 1.25rem 0;
+  padding: 1.2rem 1.35rem;
+  border: 1px solid var(--line, rgba(30, 41, 59, 0.14));
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.reminder-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.reminder-heading .eyebrow {
+  margin: 0 0 0.25rem;
+}
+
+.reminder-heading > span {
+  flex: 0 0 auto;
+  color: var(--muted, #64748b);
+  font-size: 0.88rem;
+}
+
+.reminder-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.9rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reminder-list button {
+  display: grid;
+  width: 100%;
+  gap: 0.25rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line, rgba(30, 41, 59, 0.12));
+  border-radius: 0.7rem;
+  background: #fff;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.reminder-list button:hover,
+.reminder-list button:focus-visible {
+  border-color: var(--accent, #557a72);
+}
+
+.reminder-list span,
+.reminder-note {
+  color: var(--muted, #64748b);
+  font-size: 0.9rem;
+}
+
+.reminder-note {
+  margin: 0.6rem 0 0;
+}
+
 .product-list,
 .evidence-list {
   list-style: none;

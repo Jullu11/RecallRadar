@@ -69,6 +69,7 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
+- `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. These are in-app/on-demand reminders; scheduled outbound messages are not configured.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 
