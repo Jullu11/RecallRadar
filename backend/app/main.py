@@ -19,7 +19,7 @@ from .storage import get_dashboard_snapshot, uses_memory_store
 
 
 app = FastAPI(
-    title="RecallRadar",
+    title="Lodestone",
     description="A source-backed household product recall assistant. Historical demo fixture only.",
     version="0.1.0",
 )
@@ -155,14 +155,14 @@ async def search_cpsc_recalls(
 @app.post("/api/photon/message")
 async def photon_message(
     event: dict,
-    x_recall_radar_internal: str | None = Header(default=None),
+    x_lodestone_internal: str | None = Header(default=None),
 ) -> dict[str, str]:
     from .conversation import PhotonMessage, handle_photon_message
 
     expected = get_settings().backend_internal_token
     if not expected:
         raise HTTPException(status_code=503, detail="The Spectrum gateway shared secret is not configured.")
-    if not x_recall_radar_internal or not hmac.compare_digest(x_recall_radar_internal, expected):
+    if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
         raise HTTPException(status_code=401, detail="Unauthorized.")
 
     try:
@@ -172,7 +172,7 @@ async def photon_message(
 
     allowed = get_settings().allowed_sender_id_set
     if parsed.sender_id not in allowed and not (get_settings().demo_mode or uses_memory_store()):
-        raise HTTPException(status_code=403, detail="This sender is not allowed to use RecallRadar.")
+        raise HTTPException(status_code=403, detail="This sender is not allowed to use Lodestone.")
     if parsed.content_type == "attachment" and parsed.image is None:
         raise HTTPException(status_code=400, detail="Attachment data is missing.")
     if parsed.content_type == "text" and parsed.image is not None:
@@ -183,7 +183,7 @@ async def photon_message(
     except Exception as error:
         import logging
 
-        logging.getLogger("recallradar").exception("Photon message processing failed: %s", error)
+        logging.getLogger("lodestone").exception("Photon message processing failed: %s", error)
         raise HTTPException(status_code=503, detail="Message processing failed. Please retry.") from error
 
 

@@ -1,6 +1,6 @@
-# RecallRadar
+# Lodestone: Every purchase, on record
 
-RecallRadar helps a household identify a product from a receipt or label, check official recall evidence, and track a next step in iMessage.
+Lodestone helps people save purchase records once and use them later for warranty claims, recalls, returns, price refunds, and other ways to recover money. **Every purchase, on record.** The current MVP starts with household product recall checks; warranty, return, and price adjustment workflows are part of the product direction, not implemented features yet.
 
 The first demo is scoped to household products and CPSC notices. Its deterministic historical example is the myCharge POWER HUB recall (CPSC recall 24-271). It is historical demonstration data, not a current alert feed. The notice affects models AO10FK-A, AO10FK-B, and AO10FK-C with date codes ending in 21 or 22, plus 0123, 0923, 1523, and 1723. See the [official CPSC notice](https://www.cpsc.gov/Recalls/2024/myCharge-Recalls-POWER-HUB-All-In-One-Portable-Chargers-Due-to-Fire-and-Burn-Hazards-Sold-Exclusively-at-Costco).
 
@@ -46,7 +46,7 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
 
 5. Check the API at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health), explore the OpenAPI interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs), and view the historical fixture at [http://127.0.0.1:8000/api/demo/notice](http://127.0.0.1:8000/api/demo/notice). The live inventory/evidence payload is at [http://127.0.0.1:8000/api/dashboard](http://127.0.0.1:8000/api/dashboard).
 
-Spectrum Cloud needs a public HTTPS webhook. Use your preferred HTTPS tunnel to expose local port `8001`, then register `https://<tunnel-host>/webhook` in the Photon dashboard. Keep the FastAPI port private. `PUBLIC_BASE_URL` is optional documentation/configuration metadata; the gateway currently receives its external webhook URL in the Photon dashboard.
+The gateway connects outbound to Spectrum Cloud and listens to its message stream. It calls the local FastAPI service at `http://127.0.0.1:8000`; this setup does not need a public webhook or HTTPS tunnel. Keep the FastAPI port private.
 
 Run `make local-check` to syntax-check the Python modules, type-check the gateway, and run unit tests for identifier matching and conversation flows. That command does not call Gemini, live Photon, or require Supabase.
 
@@ -75,5 +75,5 @@ Product records are saved only after the user confirms the extracted details. Mo
 - If the gateway exits at startup, check `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET`, and `ALLOWED_SENDER_IDS` in `.env`.
 - If the API starts but image extraction fails, check `GEMINI_API_KEY`.
 - If product saves fail, confirm the SQL migration was applied and the Supabase URL/service-role key are correct.
-- If Photon cannot deliver events, make sure the HTTPS tunnel is running and the Photon webhook URL ends in `/webhook`.
+- If Photon messages do not arrive, check the gateway output, Spectrum project credentials, and the exact sender ID in `ALLOWED_SENDER_IDS`.
 - The API health route does not need external credentials; Gemini, Supabase, Spectrum, and the CPSC service do.

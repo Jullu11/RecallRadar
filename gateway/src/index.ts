@@ -120,7 +120,7 @@ async function handleInbound(space: any, message: any): Promise<void> {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-recall-radar-internal": process.env.BACKEND_INTERNAL_TOKEN!,
+      "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
     },
     body: JSON.stringify(incoming),
   });
@@ -144,7 +144,7 @@ const app = new Hono();
 app.get("/health", (c) => c.json({ status: "ok", mode: "stream" }));
 
 serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`RecallRadar health server on http://localhost:${info.port}`);
+  console.log(`Lodestone health server on http://localhost:${info.port}`);
 });
 
 console.log("Listening for iMessages on Spectrum app.messages stream…");
