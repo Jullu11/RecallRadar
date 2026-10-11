@@ -19,6 +19,8 @@ for (const key of required) {
 
 const backendUrl = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
 const port = Number(process.env.SPECTRUM_PORT ?? "8001");
+// Gemini extraction plus CPSC lookups can take a while; give up well before the user retries.
+const backendTimeoutMs = Number(process.env.BACKEND_TIMEOUT_MS ?? "60000");
 const allowedSenderIds = new Set(
   (process.env.ALLOWED_SENDER_IDS ?? "")
     .split(",")
@@ -120,14 +122,25 @@ async function handleInbound(space: any, message: any): Promise<void> {
 
   console.log(`Inbound from ${senderId}: ${String(incoming.text ?? "[attachment]").slice(0, 80)}`);
 
-  const response = await fetch(`${backendUrl}/api/photon/message`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
-    },
-    body: JSON.stringify(incoming),
-  });
+  if (incoming.content_type === "attachment") void space.startTyping?.().catch(() => {});
+
+  // Bounded wait: a hung backend call must not block every later message in the stream loop.
+  let response: Response;
+  try {
+    response = await fetch(`${backendUrl}/api/photon/message`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
+      },
+      body: JSON.stringify(incoming),
+      signal: AbortSignal.timeout(backendTimeoutMs),
+    });
+  } catch (error) {
+    console.error(`FastAPI request to ${backendUrl} failed`, error);
+    await space.send("I couldn't reach the Lodestone service just now. Please resend your message in a moment.");
+    return;
+  }
   if (!response.ok) {
     console.error("FastAPI message handler failed", response.status, await response.text());
     await space.send("I couldn't finish that check just now. Please try again shortly.");
@@ -152,6 +165,7 @@ serve({ fetch: app.fetch, port }, (info) => {
 });
 
 console.log("Listening for iMessages on Spectrum app.messages stream…");
+console.log(`Forwarding to FastAPI at ${backendUrl}`);
 console.log(
   allowAllSenders
     ? "Allowed senders: * (anyone)"
