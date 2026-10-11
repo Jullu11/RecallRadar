@@ -33,7 +33,7 @@ Requirements: Python 3.11 or newer, Node.js 20 or newer, npm, and GNU Make. The 
    select vault.create_secret('YOUR_BACKEND_INTERNAL_TOKEN', 'lodestone_internal_token');
    ```
 
-   This job checks due watches once every 24 hours, in batches of up to 25. The API deployment must be reachable from Supabase and have `KEEPA_API_KEY` configured. Results update the evidence desk; automated outbound price-drop iMessages are not enabled.
+   This job checks due watches once every 24 hours, in batches of up to 25. The API deployment must be reachable from Supabase and have `KEEPA_API_KEY` configured. Migration `0007` adds the notification outbox. The gateway sends queued reminders and price-target alerts while it is running.
 
 4. Start the API and gateway in separate terminals from the repository root:
 
@@ -77,10 +77,10 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 - Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
 - Supabase stores confirmed product details, opt-in state, match evidence, follow-up status, and price-watch records.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
-- Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.
-- `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. These are in-app/on-demand reminders; scheduled outbound messages are not configured.
+- Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms or submit claims.
+- `REMINDERS` lists open actions that are overdue or due in the next 30 days. The evidence desk shows all open dates and links each reminder to its saved product. The gateway checks for upcoming/overdue dates and sends one iMessage reminder per date when it is running; messages may be delayed while the gateway is offline.
 - `PACKET <action number> FOR <merchant>` drafts a copyable support message from the saved product details and the date the user entered. Missing order, payment, and issue details remain placeholders; the packet does not assert merchant policy or eligibility and is not submitted or saved as a separate record.
-- `WATCH PRICE <item> <Amazon URL> BELOW <$amount>` saves an Amazon.com price target. `PRICE CHECK <watch>` fetches the latest recorded Amazon price through Keepa; `PRICE WATCHES` lists saved checks and `STOP PRICE <watch>` pauses one. Add `KEEPA_API_KEY` for checks. With migrations `0006` and the Vault secrets configured, Supabase Cron checks up to 25 due watches hourly; each watch is checked at most once per 24 hours. Results update the evidence desk; automated outbound price-drop iMessages are not enabled.
+- `WATCH PRICE <item> <Amazon URL> BELOW <$amount>` saves an Amazon.com price target. `PRICE CHECK <watch>` fetches the latest recorded Amazon price through Keepa; `PRICE WATCHES` lists saved checks and `STOP PRICE <watch>` pauses one. Add `KEEPA_API_KEY` for checks. With migration `0006` and the Vault secrets configured, Supabase Cron checks up to 25 due watches hourly; each watch is checked at most once per 24 hours. The gateway sends a one-time iMessage when the recorded price reaches its target.
 
 Do not treat “no match found in checked sources” as proof that a product is safe. The demo will identify historical fixture data wherever it appears.
 

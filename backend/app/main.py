@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hmac
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +18,12 @@ from .settings import get_settings
 from .storage import (
     get_dashboard_snapshot,
     list_active_price_watches,
+    list_pending_notifications,
+    acknowledge_notification,
+    enqueue_notification,
+    list_owner_products,
+    list_owner_price_watches,
+    list_owner_recovery_cases,
     record_price_check,
     uses_memory_store,
 )
@@ -107,6 +113,76 @@ async def run_price_watches(x_lodestone_internal: str | None = Header(default=No
             )
             failed += 1
     return {"checked": checked, "failed": failed}
+
+
+@app.post("/api/notifications/pending")
+def pending_notifications(x_lodestone_internal: str | None = Header(default=None)) -> dict[str, list[dict[str, str]]]:
+    """Queue due deadline and price-target alerts, then return pending gateway deliveries."""
+    expected = get_settings().backend_internal_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="The internal gateway token is not configured.")
+    if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    today = datetime.now(timezone.utc).date()
+    for owner in get_settings().allowed_sender_id_set:
+        products = list_owner_products(owner_handle=owner)
+        product_names = {row["id"]: row.get("product_name") or "your product" for row in products}
+        for case in list_owner_recovery_cases(owner_handle=owner):
+            if case.get("status") != "open" or not case.get("due_date"):
+                continue
+            try:
+                days = (date.fromisoformat(str(case["due_date"])) - today).days
+            except ValueError:
+                continue
+            if -30 <= days <= 7:
+                item = product_names.get(case.get("product_id"), "your product")
+                if days < 0:
+                    deadline = f"was due {-days} day(s) ago"
+                elif days == 0:
+                    deadline = "is due today"
+                elif days == 1:
+                    deadline = "is due tomorrow"
+                else:
+                    deadline = f"is due in {days} days"
+                enqueue_notification(
+                    owner_handle=owner,
+                    dedupe_key=f"deadline:{case['id']}:{case['due_date']}",
+                    message=(
+                        f"Lodestone reminder: your {str(case.get('case_type', 'purchase')).replace('_', ' ')} "
+                        f"date for {item} {deadline} ({case['due_date']}). These dates are user-provided; "
+                        "check the merchant's terms. Text REMINDERS to review your dates."
+                    ),
+                )
+
+        for watch in list_owner_price_watches(owner_handle=owner):
+            current = watch.get("current_price")
+            target = watch.get("target_price")
+            if watch.get("is_active") and current is not None and target is not None and float(current) <= float(target):
+                enqueue_notification(
+                    owner_handle=owner,
+                    dedupe_key=f"price-target:{watch['id']}",
+                    message=(
+                        f"Lodestone price alert: {watch.get('provider_title') or 'Your Amazon watch'} is at "
+                        f"${float(current):.2f}, at or below your ${float(target):.2f} target, based on the latest Keepa data. "
+                        f"Open the listing: {watch['product_url']}"
+                    ),
+                )
+
+    return {"notifications": list_pending_notifications()}
+
+
+@app.post("/api/notifications/{notification_id}/sent")
+def notification_sent(
+    notification_id: str,
+    x_lodestone_internal: str | None = Header(default=None),
+) -> dict[str, bool]:
+    expected = get_settings().backend_internal_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="The internal gateway token is not configured.")
+    if not x_lodestone_internal or not hmac.compare_digest(x_lodestone_internal, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+    return {"acknowledged": acknowledge_notification(notification_id=notification_id)}
 
 
 @app.post("/api/extract")

@@ -139,6 +139,50 @@ const spectrum = await Spectrum({
   providers: [imessage.config()],
 });
 
+let dispatchingNotifications = false;
+async function dispatchPendingNotifications(): Promise<void> {
+  if (dispatchingNotifications) return;
+  dispatchingNotifications = true;
+  try {
+    const response = await fetch(`${backendUrl}/api/notifications/pending`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN!,
+      },
+      body: "{}",
+    });
+    if (!response.ok) {
+      console.error("Notification queue request failed", response.status, await response.text());
+      return;
+    }
+    const payload = (await response.json()) as {
+      notifications?: Array<{ id: string; owner_handle: string; message: string }>;
+    };
+    for (const notification of payload.notifications ?? []) {
+      if (!allowedSenderIds.has(notification.owner_handle)) continue;
+      try {
+        const space = await spectrum.space(notification.owner_handle);
+        await space.send(notification.message);
+        const ack = await fetch(`${backendUrl}/api/notifications/${encodeURIComponent(notification.id)}/sent`, {
+          method: "POST",
+          headers: { "x-lodestone-internal": process.env.BACKEND_INTERNAL_TOKEN! },
+        });
+        if (!ack.ok) console.error("Notification acknowledgement failed", notification.id, ack.status);
+      } catch (error) {
+        console.error("Notification delivery failed", notification.id, error);
+      }
+    }
+  } catch (error) {
+    console.error("Notification poll failed", error);
+  } finally {
+    dispatchingNotifications = false;
+  }
+}
+
+void dispatchPendingNotifications();
+setInterval(() => void dispatchPendingNotifications(), 60_000);
+
 // Health endpoint only — inbound iMessages use the long-lived Spectrum stream.
 const app = new Hono();
 app.get("/health", (c) => c.json({ status: "ok", mode: "stream" }));

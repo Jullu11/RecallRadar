@@ -35,6 +35,7 @@ class _MemoryStore:
         self.recovery_cases: dict[str, dict[str, Any]] = {}
         self.price_watches: dict[str, dict[str, Any]] = {}
         self.receipt_images: dict[tuple[str, str], dict[str, Any]] = {}
+        self.notification_outbox: dict[str, dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
 
@@ -447,6 +448,51 @@ def pause_price_watch(*, owner_handle: str, watch_id: str) -> bool:
     return bool(result.data)
 
 
+def enqueue_notification(*, owner_handle: str, dedupe_key: str, message: str) -> None:
+    row = {"owner_handle": owner_handle, "dedupe_key": dedupe_key, "message": message}
+    if uses_memory_store():
+        with _MEMORY.lock:
+            _MEMORY.notification_outbox.setdefault(dedupe_key, {
+                **row, "id": str(uuid.uuid4()), "created_at": _now(), "sent_at": None,
+            })
+        return
+    try:
+        get_supabase().table("notification_outbox").insert(row).execute()
+    except Exception as error:
+        # A duplicate dedupe key means the notification is already queued/sent.
+        if "23505" not in str(error) and "duplicate key" not in str(error).casefold():
+            raise
+
+
+def list_pending_notifications(*, limit: int = 50) -> list[dict[str, Any]]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            rows = [copy.deepcopy(row) for row in _MEMORY.notification_outbox.values() if row.get("sent_at") is None]
+        rows.sort(key=lambda row: row.get("created_at", ""))
+        return rows[:limit]
+    result = (
+        get_supabase().table("notification_outbox")
+        .select("id,owner_handle,message,created_at")
+        .is_("sent_at", "null").order("created_at").limit(limit).execute()
+    )
+    return result.data or []
+
+
+def acknowledge_notification(*, notification_id: str) -> bool:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = next((item for item in _MEMORY.notification_outbox.values() if item["id"] == notification_id), None)
+            if not row:
+                return False
+            row["sent_at"] = _now()
+            return True
+    result = (
+        get_supabase().table("notification_outbox").update({"sent_at": _now()})
+        .eq("id", notification_id).is_("sent_at", "null").execute()
+    )
+    return bool(result.data)
+
+
 def delete_owner_products(*, owner_handle: str) -> int:
     """Delete an owner's product records; related evidence cascades in Postgres."""
     if uses_memory_store():
@@ -469,6 +515,10 @@ def delete_owner_products(*, owner_handle: str) -> int:
             _MEMORY.receipt_images = {
                 key: row for key, row in _MEMORY.receipt_images.items() if key[0] != owner_handle
             }
+            _MEMORY.notification_outbox = {
+                key: row for key, row in _MEMORY.notification_outbox.items()
+                if row["owner_handle"] != owner_handle
+            }
             _MEMORY.photon_events = {
                 eid: row for eid, row in _MEMORY.photon_events.items() if row["owner_handle"] != owner_handle
             }
@@ -480,6 +530,7 @@ def delete_owner_products(*, owner_handle: str) -> int:
     if paths:
         client.storage.from_("receipt-images").remove(paths)
     client.table("receipt_images").delete().eq("owner_handle", owner_handle).execute()
+    client.table("notification_outbox").delete().eq("owner_handle", owner_handle).execute()
     result = client.table("products").select("id").eq("owner_handle", owner_handle).execute()
     count = len(result.data or [])
     client.table("products").delete().eq("owner_handle", owner_handle).execute()
@@ -813,6 +864,7 @@ def reset_memory_store() -> None:
         _MEMORY.recovery_cases.clear()
         _MEMORY.price_watches.clear()
         _MEMORY.receipt_images.clear()
+        _MEMORY.notification_outbox.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
 
