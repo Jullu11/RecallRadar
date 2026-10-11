@@ -57,6 +57,9 @@ def save_confirmed_product(
     product_name: str,
     identifiers: dict[str, Any],
     source_type: str,
+    field_provenance: dict[str, Any] | None = None,
+    receipt_fingerprint: str | None = None,
+    receipt_item_index: int | None = None,
 ) -> dict[str, Any]:
     """Store only user-confirmed structured fields; uploaded images are not stored here."""
     if uses_memory_store():
@@ -66,7 +69,10 @@ def save_confirmed_product(
             "brand": brand,
             "product_name": product_name,
             "identifiers": copy.deepcopy(identifiers),
+            "field_provenance": copy.deepcopy(field_provenance or {}),
             "source_type": source_type,
+            "receipt_fingerprint": receipt_fingerprint,
+            "receipt_item_index": receipt_item_index,
             "monitoring_enabled": False,
             "monitoring_consented_at": None,
             "status": "owned",
@@ -74,25 +80,69 @@ def save_confirmed_product(
             "updated_at": _now(),
         }
         with _MEMORY.lock:
+            if receipt_fingerprint is not None and receipt_item_index is not None:
+                duplicate = next(
+                    (
+                        existing
+                        for existing in _MEMORY.products.values()
+                        if existing["owner_handle"] == owner_handle
+                        and existing.get("receipt_fingerprint") == receipt_fingerprint
+                        and existing.get("receipt_item_index") == receipt_item_index
+                    ),
+                    None,
+                )
+                if duplicate:
+                    return {**copy.deepcopy(duplicate), "_duplicate": True}
             _MEMORY.products[row["id"]] = row
-            return copy.deepcopy(row)
+            return {**copy.deepcopy(row), "_duplicate": False}
 
-    result = (
-        get_supabase()
-        .table("products")
-        .insert(
+    client = get_supabase()
+    if receipt_fingerprint is not None and receipt_item_index is not None:
+        existing = (
+            client.table("products")
+            .select("id,owner_handle,brand,product_name,identifiers,field_provenance,source_type,monitoring_enabled,status,created_at")
+            .eq("owner_handle", owner_handle)
+            .eq("receipt_fingerprint", receipt_fingerprint)
+            .eq("receipt_item_index", receipt_item_index)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return {**existing.data[0], "_duplicate": True}
+
+    try:
+        result = client.table("products").insert(
             {
                 "owner_handle": owner_handle,
                 "brand": brand,
                 "product_name": product_name,
                 "identifiers": identifiers,
+                "field_provenance": field_provenance or {},
                 "source_type": source_type,
+                "receipt_fingerprint": receipt_fingerprint,
+                "receipt_item_index": receipt_item_index,
                 "monitoring_enabled": False,
             }
+        ).execute()
+        return {**result.data[0], "_duplicate": False}
+    except Exception as error:
+        # The unique receipt-item index closes the race between a duplicate lookup and insert.
+        if receipt_fingerprint is None or receipt_item_index is None or not (
+            "23505" in str(error) or "duplicate key" in str(error).casefold()
+        ):
+            raise
+        existing = (
+            client.table("products")
+            .select("id,owner_handle,brand,product_name,identifiers,field_provenance,source_type,monitoring_enabled,status,created_at")
+            .eq("owner_handle", owner_handle)
+            .eq("receipt_fingerprint", receipt_fingerprint)
+            .eq("receipt_item_index", receipt_item_index)
+            .limit(1)
+            .execute()
         )
-        .execute()
-    )
-    return result.data[0]
+        if not existing.data:
+            raise
+        return {**existing.data[0], "_duplicate": True}
 
 
 def enable_monitoring(*, product_id: str, owner_handle: str) -> dict[str, Any]:
@@ -385,7 +435,13 @@ def set_conversation(*, owner_handle: str, state: str, payload: dict[str, Any]) 
     ).execute()
 
 
-def update_product_identifiers(*, product_id: str, owner_handle: str, updates: dict[str, Any]) -> dict[str, Any]:
+def update_product_identifiers(
+    *,
+    product_id: str,
+    owner_handle: str,
+    updates: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if uses_memory_store():
         with _MEMORY.lock:
             row = _MEMORY.products.get(product_id)
@@ -393,13 +449,22 @@ def update_product_identifiers(*, product_id: str, owner_handle: str, updates: d
                 raise LookupError("Product was not found for this message sender.")
             identifiers = {**(row.get("identifiers") or {}), **updates}
             row["identifiers"] = identifiers
+            field_provenance = copy.deepcopy(row.get("field_provenance") or {})
+            default_provenance = {
+                "source": "user",
+                "user_confirmed": True,
+                "confirmed_at": _now(),
+            }
+            for key in updates:
+                field_provenance[key] = copy.deepcopy((provenance or {}).get(key) or default_provenance)
+            row["field_provenance"] = field_provenance
             row["updated_at"] = _now()
             return copy.deepcopy(row)
 
     client = get_supabase()
     existing = (
         client.table("products")
-        .select("identifiers")
+        .select("identifiers,field_provenance")
         .eq("id", product_id)
         .eq("owner_handle", owner_handle)
         .limit(1)
@@ -408,9 +473,23 @@ def update_product_identifiers(*, product_id: str, owner_handle: str, updates: d
     if not existing.data:
         raise LookupError("Product was not found for this message sender.")
     identifiers = {**(existing.data[0].get("identifiers") or {}), **updates}
+    field_provenance = {**(existing.data[0].get("field_provenance") or {})}
+    default_provenance = {
+        "source": "user",
+        "user_confirmed": True,
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for key in updates:
+        field_provenance[key] = copy.deepcopy((provenance or {}).get(key) or default_provenance)
     result = (
         client.table("products")
-        .update({"identifiers": identifiers, "updated_at": datetime.now(timezone.utc).isoformat()})
+        .update(
+            {
+                "identifiers": identifiers,
+                "field_provenance": field_provenance,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         .eq("id", product_id)
         .eq("owner_handle", owner_handle)
         .execute()
@@ -614,7 +693,7 @@ def get_dashboard_snapshot() -> dict[str, Any]:
     client = get_supabase()
     products = (
         client.table("products")
-        .select("id,owner_handle,brand,product_name,identifiers,status,monitoring_enabled,source_type,created_at,updated_at")
+        .select("id,owner_handle,brand,product_name,identifiers,field_provenance,status,monitoring_enabled,source_type,created_at,updated_at")
         .order("created_at", desc=True)
         .limit(100)
         .execute()

@@ -63,6 +63,9 @@ If the live CPSC API times out, `CPSC_FIXTURE_FALLBACK=true` returns the labeled
 
 - Spectrum Cloud receives and sends direct iMessages through the Node gateway; FastAPI owns product and recall behavior.
 - Gemini extracts product identifiers from receipt and label images. Unknown fields remain unknown and require confirmation.
+- Multi-item receipts can be reviewed together, selected by item number, and corrected with `EDIT <field> <value>` before saving. Re-uploading the identical image avoids duplicate rows for the same receipt item.
+- The app stores per-field source/confirmation metadata and a one-way receipt-image fingerprint for deduplication. It does not retain uploaded receipt or label image bytes.
+- Use `CHECK <number>` to check a saved item and `MONITOR <number>` to opt that item into ongoing checks.
 - Supabase stores confirmed product details, opt-in state, match evidence, and follow-up status.
 - CPSC provides recall candidates. Exact identifiers determine the result for the included historical fixture; fuzzy similarity only finds candidates.
 - Users can record return, warranty, and price-adjustment dates against a saved product with `RETURN BY YYYY-MM-DD`, `WARRANTY UNTIL YYYY-MM-DD`, or `PRICE ADJUST BY YYYY-MM-DD`. These are user-provided dates; Lodestone does not verify retailer terms, submit claims, or send proactive deadline notifications yet.

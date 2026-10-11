@@ -190,6 +190,29 @@ export default function App() {
                     </dd>
                   </div>
                   <div>
+                    <dt>Capture details</dt>
+                    <dd>
+                      {(() => {
+                        const fields = [
+                          ["Brand", selectedProduct.brand ? "brand" : ""],
+                          ["Product", "product_name"],
+                          ...Object.keys(selectedProduct.identifiers || {}).map((key) => [key.replaceAll("_", " "), key]),
+                        ] as const;
+                        const details = fields.flatMap(([label, key]) => {
+                          const origin = selectedProduct.field_provenance?.[key];
+                          if (!origin) return [];
+                          const source = origin.user_corrected
+                            ? "corrected by you"
+                            : origin.source === "user"
+                              ? "entered by you"
+                              : `read from ${origin.source_type || "photo"}`;
+                          return [`${label}: ${source}`];
+                        });
+                        return details.length ? details.join(" · ") : "Capture source details unavailable for this record";
+                      })()}
+                    </dd>
+                  </div>
+                  <div>
                     <dt>Purchase recovery</dt>
                     <dd>
                       {!selectedRecoveryCases.length ? (

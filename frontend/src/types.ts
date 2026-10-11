@@ -9,6 +9,13 @@ export type Product = {
   status: string;
   monitoring_enabled: boolean;
   source_type?: string;
+  field_provenance?: Record<string, {
+    source?: string;
+    source_type?: string;
+    user_confirmed?: boolean;
+    user_corrected?: boolean;
+    confirmed_at?: string;
+  }>;
   created_at?: string;
 };
 
