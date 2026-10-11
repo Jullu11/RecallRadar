@@ -5,7 +5,7 @@ setup:
 	@python3 -m venv .venv
 	@.venv/bin/python -m pip install -r requirements.txt
 	@npm --prefix gateway ci
-	@npm --prefix frontend ci || npm --prefix frontend install
+	@npm --prefix frontend ci
 	@echo "Local dependencies are installed. Edit .env, apply the Supabase migration, then run 'make api', 'make gateway', and optionally 'make web'."
 
 api:
@@ -28,3 +28,7 @@ local-check:
 	@cd gateway && npm exec -- tsc --noEmit
 	@cd frontend && npm exec -- tsc --noEmit
 	@$(MAKE) test
+
+# Local-only, volatile sample workspace. No provider credentials required.
+demo: web-build
+	@DEMO_MODE=true GEMINI_API_KEY= KEEPA_API_KEY= .venv/bin/uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000

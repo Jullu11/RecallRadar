@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: lodestone
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /ready
+    envVars:
+      - key: DEMO_MODE
+        value: "false"
+      - key: CPSC_FIXTURE_FALLBACK
+        value: "false"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: BACKEND_INTERNAL_TOKEN
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: KEEPA_API_KEY
+        sync: false
