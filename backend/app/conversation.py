@@ -67,6 +67,7 @@ HELP_TEXT = (
     "  Add FOR ITEM 2 to choose an item from LIST\n"
     "• ACTIONS — list return, warranty, and price-adjustment cases\n"
     "• REMINDERS — show overdue actions and dates due in the next 30 days\n"
+    "• PACKET <action number> FOR <merchant> — draft a claim message to review and copy\n"
     "• CLOSE ACTION <number> / DISMISS ACTION <number> — update a case\n"
     "• EDIT <field> <value> — correct extracted fields before confirming\n"
     f"• {IDENTIFIER_HINT} — type identifiers from the package\n"
@@ -339,6 +340,59 @@ def _format_reminders(cases: list[dict[str, Any]], products: list[dict[str, Any]
         "Purchase reminders (dates you confirmed; no retailer terms were verified):\n"
         + "\n".join(lines)
         + "\nUse CLOSE ACTION <number> or DISMISS ACTION <number> when an action no longer needs tracking."
+    )
+
+
+def _claim_packet(case: dict[str, Any], product: dict[str, Any], merchant: str) -> str:
+    case_type = case.get("case_type")
+    product_name = product.get("product_name") or "[product name]"
+    brand = product.get("brand")
+    item_name = f"{brand} {product_name}" if brand else product_name
+    identifiers = product.get("identifiers") or {}
+    purchase_date = identifiers.get("purchase_date") or "[purchase date]"
+    order_type = {
+        "return": "return",
+        "warranty": "warranty",
+        "price_adjustment": "price adjustment",
+    }.get(case_type, "purchase")
+    deadline_label = {
+        "return": "return deadline",
+        "warranty": "warranty end date",
+        "price_adjustment": "price-adjustment deadline",
+    }.get(case_type, "action date")
+    subject = {
+        "return": f"Return request: {item_name}",
+        "warranty": f"Warranty support request: {item_name}",
+        "price_adjustment": f"Price adjustment request: {item_name}",
+    }.get(case_type, f"Purchase support request: {item_name}")
+    basis = {
+        "return": f"I am contacting you about a return for {item_name}.",
+        "warranty": f"I am contacting you about warranty support for {item_name}.",
+        "price_adjustment": f"I am asking whether this purchase may qualify for a price adjustment.",
+    }.get(case_type, f"I am contacting you about {item_name}.")
+    identifier_lines = [
+        f"- {label}: {identifiers[key]}"
+        for key, label in (("model_number", "Model"), ("upc", "UPC"), ("date_code", "Date code"), ("lot_number", "Lot number"))
+        if identifiers.get(key)
+    ]
+    identifier_text = "\n".join(identifier_lines) if identifier_lines else "- Product identifiers: [add if available]"
+    return (
+        f"Draft for {merchant} — {order_type} request\n"
+        f"Subject: {subject}\n\n"
+        f"Hello {merchant} Support,\n\n"
+        f"{basis} My record shows a {deadline_label} of {case.get('due_date')} "
+        "(a date I entered in Lodestone; please confirm the applicable terms).\n\n"
+        "Purchase details:\n"
+        f"- Item: {item_name}\n"
+        f"- Purchase date: {purchase_date}\n"
+        "- Order or receipt number: [add before sending]\n"
+        "- Amount paid: [add if relevant]\n"
+        f"{identifier_text}\n\n"
+        "What happened / what I am requesting: [describe the issue and requested next step]\n\n"
+        "I can provide a copy of my receipt and any other information needed. Please let me know the next steps.\n\n"
+        "Thank you,\n[Your name]\n\n"
+        "Review and fill in bracketed details before sending. This draft does not verify "
+        f"{merchant}'s current policy or confirm eligibility."
     )
 
 
@@ -634,6 +688,24 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                     list_owner_products(owner_handle=owner),
                 )
             }
+
+        packet_command = re.fullmatch(r"PACKET\s+(\d{1,2})\s+FOR\s+(.{1,60})", text, re.IGNORECASE)
+        if packet_command:
+            merchant = packet_command.group(2).strip()
+            if not re.fullmatch(r"[\w][\w .&'’()-]{0,59}", merchant, re.UNICODE):
+                return {"reply": "Enter a merchant name using letters, numbers, spaces, or basic punctuation."}
+            cases = list_owner_recovery_cases(owner_handle=owner)
+            action_number = int(packet_command.group(1))
+            if action_number < 1 or action_number > len(cases):
+                return {"reply": "That action number is out of range. Text ACTIONS to see your tracked dates."}
+            case = cases[action_number - 1]
+            if case.get("status") != "open":
+                return {"reply": "That action is closed. Text ACTIONS and choose an open action to draft a packet."}
+            products_by_id = {product["id"]: product for product in list_owner_products(owner_handle=owner)}
+            product = products_by_id.get(case.get("product_id"))
+            if not product:
+                return {"reply": "I couldn't find the saved product for that action. Text ACTIONS and try another one."}
+            return {"reply": _claim_packet(case, product, merchant)}
 
         recovery_command = re.fullmatch(
             r"(RETURN BY|WARRANTY UNTIL|PRICE ADJUST BY)\s+(\d{4}-\d{2}-\d{2})(?:\s+FOR ITEM\s+(\d{1,2}))?",

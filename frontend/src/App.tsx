@@ -280,6 +280,11 @@ export default function App() {
                                 {item.due_date} · {item.status.replace("_", " ")}
                                 {item.date_source === "user_confirmed" ? " · date provided by you" : ""}
                               </span>
+                              {item.status === "open" ? (
+                                <span>
+                                  Draft a merchant message: text PACKET {((data?.recovery_cases.findIndex((action) => action.id === item.id) ?? -1) + 1)} FOR &lt;merchant&gt;
+                                </span>
+                              ) : null}
                             </li>
                           ))}
                         </ul>
