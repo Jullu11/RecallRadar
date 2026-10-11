@@ -165,6 +165,41 @@ class ConversationTests(unittest.TestCase):
         self.assertIn("historical", second.casefold())
         self.assertIn("⚠", second)
 
+    def _awaiting_follow_up(self) -> dict:
+        product = save_confirmed_product(
+            owner_handle=self.owner,
+            brand="myCharge",
+            product_name="POWER HUB",
+            identifiers={"model_number": "AO10FK-A", "date_code": "1521"},
+            source_type="receipt",
+        )
+        set_conversation(
+            owner_handle=self.owner,
+            state="awaiting_follow_up",
+            payload={"product_id": product["id"], "last_product_id": product["id"],
+                     "brand": "myCharge", "product_name": "POWER HUB"},
+        )
+        return product
+
+    def test_follow_up_accepts_ownership_updates(self) -> None:
+        self._awaiting_follow_up()
+        reply = self._send("RETURNED")
+        self.assertIn("returned", reply.casefold())
+        self.assertEqual(list_owner_products(owner_handle=self.owner)[0]["status"], "returned")
+
+    def test_unrecognized_text_keeps_product_for_status_update(self) -> None:
+        self._awaiting_follow_up()
+        set_conversation(owner_handle=self.owner, state="idle",
+                         payload={"last_product_id": list_owner_products(owner_handle=self.owner)[0]["id"]})
+        self._send("what now")
+        self.assertIn("returned", self._send("RETURNED").casefold())
+        self.assertEqual(list_owner_products(owner_handle=self.owner)[0]["status"], "returned")
+
+    def test_follow_up_accepts_label_and_still_prompts_on_other_text(self) -> None:
+        self._awaiting_follow_up()
+        self.assertIn("reply DONE", self._send("what now"))
+        self.assertIn("label", self._send("LABEL").casefold())
+
     def test_calendar_date_and_done_get_specific_guidance(self) -> None:
         product = save_confirmed_product(
             owner_handle=self.owner,

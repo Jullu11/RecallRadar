@@ -55,6 +55,16 @@ class PhotonMessage(BaseModel):
 
 IDENTIFIER_HINT = "MODEL <model on label> DATE <code on label>"
 
+STATUS_COMMANDS = {
+    "consumed": "consumed",
+    "returned": "returned",
+    "removed": "removed",
+    "no longer own": "no_longer_owned",
+    "no longer owned": "no_longer_owned",
+}
+# Commands that still work while a match is waiting for DONE.
+FOLLOW_UP_PASSTHROUGH = {"label", "monitor", "receipt", "add product", "add", "no"}
+
 HELP_TEXT = (
     "Lodestone: Every purchase, on record. Save receipts for the moments they matter.\n"
     "I can check recalls and track return, warranty, and price-adjustment dates you provide.\n"
@@ -1170,23 +1180,29 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
                 context = _product_context_payload(product) if product else {"last_product_id": product_id}
                 set_conversation(owner_handle=owner, state="idle", payload=context)
                 return {"reply": "Thanks, I recorded that follow-up as complete. Text CHECK anytime to re-check this product."}
-            return {"reply": "When you've handled the remedy, reply DONE and I'll record it."}
+            # Let ownership updates, LABEL, MONITOR, new receipts, and typed identifiers reach their handlers.
+            passthrough = lowered in FOLLOW_UP_PASSTHROUGH or lowered in STATUS_COMMANDS
+            parsed_ids = _parse_identifiers(text)
+            if not passthrough and not (parsed_ids.get("model_number") or parsed_ids.get("date_code")):
+                return {"reply": "When you've handled the remedy, reply DONE and I'll record it."}
+            if lowered == "no":
+                set_conversation(owner_handle=owner, state="idle", payload=payload)
+                return {"reply": "OK. Reply DONE once you've handled the remedy, or RETURNED / REMOVED to update the product."}
 
-        status_commands = {
-            "consumed": "consumed",
-            "returned": "returned",
-            "removed": "removed",
-            "no longer own": "no_longer_owned",
-            "no longer owned": "no_longer_owned",
-        }
-        if lowered in status_commands:
+        if lowered in STATUS_COMMANDS:
             product_id = payload.get("product_id") or payload.get("last_product_id")
+            if not product_id:
+                # Same fallback as STOP/CHECK: apply to the latest saved product.
+                products = list_owner_products(owner_handle=owner)
+                product_id = products[-1]["id"] if products else None
             if not product_id or not update_product_status(
                 product_id=product_id,
                 owner_handle=owner,
-                status=status_commands[lowered],
+                status=STATUS_COMMANDS[lowered],
             ):
                 return {"reply": "I couldn't find a saved product to update. Send a receipt photo to add one."}
+            if state == "awaiting_follow_up":
+                complete_latest_follow_up(product_id=product_id)
             set_conversation(owner_handle=owner, state="idle", payload={**payload, "last_product_id": product_id})
             return {"reply": f"Marked the saved product as {lowered}."}
 
@@ -1228,7 +1244,9 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
         if product_id and (parsed.get("model_number") or parsed.get("date_code")):
             return {"reply": await _apply_typed_identifiers(owner, product_id, parsed)}
 
-        set_conversation(owner_handle=owner, state="awaiting_receipt", payload={})
+        # Unrecognized text: keep the current product context so RETURNED/LABEL/CHECK still apply to it.
+        kept = {"last_product_id": product_id} if product_id else {}
+        set_conversation(owner_handle=owner, state="awaiting_receipt", payload=kept)
         return {
             "reply": (
                 "Hi, I'm Lodestone: Every purchase, on record. Send a receipt photo to save a household product. "
