@@ -32,6 +32,7 @@ class _MemoryStore:
         self.notices: dict[tuple[str, str], dict[str, Any]] = {}
         self.matches: dict[tuple[str, str], dict[str, Any]] = {}
         self.follow_ups: list[dict[str, Any]] = []
+        self.recovery_cases: dict[str, dict[str, Any]] = {}
         self.photon_events: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
 
@@ -142,6 +143,114 @@ def list_owner_products(*, owner_handle: str) -> list[dict[str, Any]]:
     return result.data or []
 
 
+def create_recovery_case(
+    *,
+    owner_handle: str,
+    product_id: str,
+    case_type: str,
+    due_date: str,
+) -> dict[str, Any]:
+    """Create a user-sourced recovery opportunity for one of the owner's products."""
+    if uses_memory_store():
+        with _MEMORY.lock:
+            product = _MEMORY.products.get(product_id)
+            if not product or product["owner_handle"] != owner_handle:
+                raise LookupError("Product was not found for this message sender.")
+            row = {
+                "id": str(uuid.uuid4()),
+                "owner_handle": owner_handle,
+                "product_id": product_id,
+                "case_type": case_type,
+                "due_date": due_date,
+                "status": "open",
+                "date_source": "user_confirmed",
+                "created_at": _now(),
+                "completed_at": None,
+            }
+            _MEMORY.recovery_cases[row["id"]] = row
+            return copy.deepcopy(row)
+
+    client = get_supabase()
+    product = (
+        client.table("products")
+        .select("id")
+        .eq("id", product_id)
+        .eq("owner_handle", owner_handle)
+        .limit(1)
+        .execute()
+    )
+    if not product.data:
+        raise LookupError("Product was not found for this message sender.")
+    result = client.table("recovery_cases").insert(
+        {
+            "product_id": product_id,
+            "case_type": case_type,
+            "due_date": due_date,
+            "date_source": "user_confirmed",
+        }
+    ).execute()
+    return result.data[0]
+
+
+def list_owner_recovery_cases(*, owner_handle: str) -> list[dict[str, Any]]:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            rows = [
+                copy.deepcopy(row)
+                for row in _MEMORY.recovery_cases.values()
+                if row["owner_handle"] == owner_handle
+            ]
+        rows.sort(key=lambda item: (item.get("due_date") or "9999-12-31", item["created_at"]))
+        return rows
+
+    products = list_owner_products(owner_handle=owner_handle)
+    product_ids = [product["id"] for product in products]
+    if not product_ids:
+        return []
+    result = (
+        get_supabase()
+        .table("recovery_cases")
+        .select("id,product_id,case_type,due_date,status,date_source,created_at,completed_at")
+        .in_("product_id", product_ids)
+        .order("due_date")
+        .order("created_at")
+        .execute()
+    )
+    return result.data or []
+
+
+def set_recovery_case_status(
+    *, owner_handle: str, case_id: str, status: str
+) -> bool:
+    if uses_memory_store():
+        with _MEMORY.lock:
+            row = _MEMORY.recovery_cases.get(case_id)
+            if not row or row["owner_handle"] != owner_handle:
+                return False
+            row["status"] = status
+            row["completed_at"] = _now() if status == "completed" else None
+            return True
+
+    owned_ids = {product["id"] for product in list_owner_products(owner_handle=owner_handle)}
+    result = (
+        get_supabase()
+        .table("recovery_cases")
+        .select("id,product_id")
+        .eq("id", case_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data or result.data[0]["product_id"] not in owned_ids:
+        return False
+    get_supabase().table("recovery_cases").update(
+        {
+            "status": status,
+            "completed_at": datetime.now(timezone.utc).isoformat() if status == "completed" else None,
+        }
+    ).eq("id", case_id).execute()
+    return True
+
+
 def delete_owner_products(*, owner_handle: str) -> int:
     """Delete an owner's product records; related evidence cascades in Postgres."""
     if uses_memory_store():
@@ -151,6 +260,11 @@ def delete_owner_products(*, owner_handle: str) -> int:
                 del _MEMORY.products[pid]
             _MEMORY.matches = {key: row for key, row in _MEMORY.matches.items() if row["product_id"] not in product_ids}
             _MEMORY.follow_ups = [row for row in _MEMORY.follow_ups if row["product_id"] not in product_ids]
+            _MEMORY.recovery_cases = {
+                case_id: row
+                for case_id, row in _MEMORY.recovery_cases.items()
+                if row["product_id"] not in product_ids
+            }
             _MEMORY.conversations.pop(owner_handle, None)
             _MEMORY.photon_events = {
                 eid: row for eid, row in _MEMORY.photon_events.items() if row["owner_handle"] != owner_handle
@@ -459,6 +573,7 @@ def reset_memory_store() -> None:
         _MEMORY.notices.clear()
         _MEMORY.matches.clear()
         _MEMORY.follow_ups.clear()
+        _MEMORY.recovery_cases.clear()
         _MEMORY.photon_events.clear()
         _MEMORY.conversations.clear()
 
@@ -483,11 +598,16 @@ def get_dashboard_snapshot() -> dict[str, Any]:
                 key=lambda item: item.get("created_at") or "",
                 reverse=True,
             )
+            recovery_cases = sorted(
+                (copy.deepcopy(row) for row in _MEMORY.recovery_cases.values()),
+                key=lambda item: (item.get("due_date") or "9999-12-31", item.get("created_at") or ""),
+            )
         return {
             "products": products,
             "notices": notices,
             "matches": matches,
             "follow_ups": follow_ups,
+            "recovery_cases": recovery_cases,
             "persistence": "memory",
         }
 
@@ -528,10 +648,24 @@ def get_dashboard_snapshot() -> dict[str, Any]:
         .data
         or []
     )
+    product_ids = [product["id"] for product in products]
+    recovery_cases = (
+        client.table("recovery_cases")
+        .select("id,product_id,case_type,due_date,status,date_source,created_at,completed_at")
+        .in_("product_id", product_ids)
+        .order("due_date")
+        .order("created_at")
+        .limit(200)
+        .execute()
+        .data
+        if product_ids
+        else []
+    ) or []
     return {
         "products": products,
         "notices": notices,
         "matches": matches,
         "follow_ups": follow_ups,
+        "recovery_cases": recovery_cases,
         "persistence": "supabase",
     }

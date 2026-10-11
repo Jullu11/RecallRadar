@@ -40,11 +40,23 @@ export type FollowUp = {
   created_at: string;
 };
 
+export type RecoveryCase = {
+  id: string;
+  product_id: string;
+  case_type: "return" | "warranty" | "price_adjustment";
+  due_date: string;
+  status: "open" | "completed" | "not_applicable";
+  date_source: "user_confirmed";
+  created_at: string;
+  completed_at: string | null;
+};
+
 export type DashboardPayload = {
   products: Product[];
   matches: MatchRow[];
   notices: NoticeRow[];
   follow_ups: FollowUp[];
+  recovery_cases: RecoveryCase[];
   persistence: string;
   demo_notice: {
     title: string;

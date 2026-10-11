@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { DashboardPayload, MatchRow, Product } from "./types";
+import type { DashboardPayload, MatchRow, Product, RecoveryCase } from "./types";
 
 type View = "home" | "desk";
 
@@ -62,6 +62,11 @@ export default function App() {
   const selectedFollowUps = useMemo(() => {
     if (!data || !selectedProductId) return [];
     return data.follow_ups.filter((item) => item.product_id === selectedProductId);
+  }, [data, selectedProductId]);
+
+  const selectedRecoveryCases = useMemo(() => {
+    if (!data || !selectedProductId) return [] as RecoveryCase[];
+    return data.recovery_cases.filter((item) => item.product_id === selectedProductId);
   }, [data, selectedProductId]);
 
   if (view === "home") {
@@ -182,6 +187,34 @@ export default function App() {
                           .map(([key, value]) => `${key}: ${value}`);
                         return parts.length ? parts.join(" · ") : "None confirmed yet";
                       })()}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Purchase recovery</dt>
+                    <dd>
+                      {!selectedRecoveryCases.length ? (
+                        <span>
+                          No return, warranty, or price-adjustment dates tracked. Text HELP to the Lodestone agent
+                          to see how to add one.
+                        </span>
+                      ) : (
+                        <ul className="evidence-list">
+                          {selectedRecoveryCases.map((item) => (
+                            <li key={item.id} className="evidence-item" style={{ cursor: "default" }}>
+                              <strong>{item.case_type.replace("_", " ")}</strong>
+                              <span>
+                                {item.case_type === "return"
+                                  ? "Return by"
+                                  : item.case_type === "warranty"
+                                    ? "Coverage ends"
+                                    : "Request by"}{" "}
+                                {item.due_date} · {item.status.replace("_", " ")}
+                                {item.date_source === "user_confirmed" ? " · date provided by you" : ""}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </dd>
                   </div>
                   <div>
