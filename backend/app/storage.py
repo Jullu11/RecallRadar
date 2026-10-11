@@ -142,6 +142,36 @@ def save_receipt_image(*, owner_handle: str, fingerprint: str, image_bytes: byte
         on_conflict="owner_handle,fingerprint",
     ).execute()
 
+
+def create_receipt_image_link(*, owner_handle: str, product_id: str, expires_in: int = 1800) -> str | None:
+    """Create a short-lived signed URL for a receipt attached to an owned product."""
+    if uses_memory_store():
+        return None
+    client = get_supabase()
+    product = (
+        client.table("products").select("receipt_fingerprint")
+        .eq("id", product_id).eq("owner_handle", owner_handle).limit(1).execute()
+    )
+    if not product.data or not product.data[0].get("receipt_fingerprint"):
+        return None
+    asset = (
+        client.table("receipt_images").select("storage_path")
+        .eq("owner_handle", owner_handle)
+        .eq("fingerprint", product.data[0]["receipt_fingerprint"]).limit(1).execute()
+    )
+    if not asset.data:
+        return None
+    result = client.storage.from_("receipt-images").create_signed_url(asset.data[0]["storage_path"], expires_in)
+    signed_url = result.get("signedURL") or result.get("signedUrl")
+    if not signed_url:
+        return None
+    base_url = (get_settings().supabase_url or "").rstrip("/")
+    if str(signed_url).startswith("http"):
+        return str(signed_url)
+    if str(signed_url).startswith("/storage/"):
+        return f"{base_url}{signed_url}"
+    return f"{base_url}/storage/v1{signed_url}"
+
     try:
         result = client.table("products").insert(
             {

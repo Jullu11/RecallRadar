@@ -17,6 +17,7 @@ from .prices import amazon_asin_from_url, fetch_amazon_price
 from .storage import (
     claim_photon_event,
     complete_latest_follow_up,
+    create_receipt_image_link,
     create_follow_up,
     create_price_watch,
     create_recovery_case,
@@ -845,7 +846,20 @@ async def handle_photon_message(event: dict[str, Any]) -> dict[str, str]:
             product = products_by_id.get(case.get("product_id"))
             if not product:
                 return {"reply": "I couldn't find the saved product for that action. Text ACTIONS and try another one."}
-            return {"reply": _claim_packet(case, product, merchant)}
+            packet = _claim_packet(case, product, merchant)
+            try:
+                receipt_link = await run_in_threadpool(
+                    create_receipt_image_link, owner_handle=owner, product_id=product["id"],
+                )
+            except Exception as error:
+                print(f"Receipt link generation failed: {type(error).__name__}", flush=True)
+                receipt_link = None
+            if receipt_link:
+                packet += (
+                    "\n\nOptional receipt attachment (private link expires in 30 minutes): "
+                    f"{receipt_link}\nOnly share this link if you want the merchant to see the receipt image."
+                )
+            return {"reply": packet}
 
         recovery_command = re.fullmatch(
             r"(RETURN BY|WARRANTY UNTIL|PRICE ADJUST BY)\s+(\d{4}-\d{2}-\d{2})(?:\s+FOR ITEM\s+(\d{1,2}))?",
